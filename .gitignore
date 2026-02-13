@@ -1,0 +1,21 @@
+# Build
+build/
+cmake-build-*/
+
+# Output data (VTI, CSV, PVD)
+output/
+*.vti
+*.pvd
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/
