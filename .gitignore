@@ -17,5 +17,9 @@ output/
 # macOS
 .DS_Store
 
+# Reference papers and legacy scripts
+references/
+legacy_scripts/
+
 # Claude Code
 .claude/
