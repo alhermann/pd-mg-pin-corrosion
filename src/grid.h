@@ -23,6 +23,9 @@ struct Grid {
     // Domain origin (lower corner)
     double origin_x, origin_y, origin_z;
 
+    // Geometry (stored from config for helper functions)
+    double R_wire, L_wire, R_tube;
+
     std::vector<Vec> pos;
     std::vector<NodeType> node_type;
 

@@ -13,13 +13,31 @@ static void initialize_fields(Fields& fields, const Grid& grid,
 
     for (int i = 0; i < N; ++i) {
         switch (grid.node_type[i]) {
-            case FLUID:
+            case FLUID: {
                 fields.rho[i] = cfg.rho_f;
-                fields.vel[i] = vec_zero();  // start from rest; inlet BC drives flow
                 fields.C[i] = cfg.C_liquid_init;
                 fields.D_map[i] = cfg.D_liquid;
                 fields.phase[i] = 1; // liquid
+
+                // Initialize with Poiseuille profile for faster flow convergence
+                double px = grid.pos[i][0];
+                double v_axial;
+                if constexpr (DIM == 2) {
+                    double r_ratio2 = (px * px) / R2;
+                    if (r_ratio2 > 1.0) r_ratio2 = 1.0;
+                    v_axial = 1.5 * cfg.U_in * (1.0 - r_ratio2);
+                } else {
+                    double py = grid.pos[i][1];
+                    double r_ratio2 = (px * px + py * py) / R2;
+                    if (r_ratio2 > 1.0) r_ratio2 = 1.0;
+                    v_axial = 2.0 * cfg.U_in * (1.0 - r_ratio2);
+                }
+                Vec v_init = vec_zero();
+                if constexpr (DIM == 2) { v_init[1] = v_axial; }
+                else                    { v_init[2] = v_axial; }
+                fields.vel[i] = v_init;
                 break;
+            }
 
             case SOLID_MG:
                 fields.rho[i] = cfg.rho_f;  // use fluid density for PD flow equations

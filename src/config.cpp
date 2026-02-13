@@ -59,12 +59,14 @@ void Config::load(const std::string& filename) {
         else if (key == "C_liquid_init")     C_liquid_init = std::stod(val);
         else if (key == "C_thresh")          C_thresh = std::stod(val);
         else if (key == "w_advect")          w_advect = std::stod(val);
+        else if (key == "alpha_art_diff")    alpha_art_diff = std::stod(val);
         else if (key == "grain_size_mean")   grain_size_mean = std::stod(val);
         else if (key == "grain_size_std")    grain_size_std = std::stod(val);
         else if (key == "gb_width_cells")    gb_width_cells = std::stoi(val);
         else if (key == "k_corr")            k_corr = std::stod(val);
         else if (key == "gb_corr_factor")    gb_corr_factor = std::stod(val);
         else if (key == "cfl_factor")        cfl_factor = std::stod(val);
+        else if (key == "cfl_factor_corr")  cfl_factor_corr = std::stod(val);
         else if (key == "flow_max_iters")    flow_max_iters = std::stoi(val);
         else if (key == "flow_conv_tol")     flow_conv_tol = std::stod(val);
         else if (key == "T_final")           T_final = std::stod(val);

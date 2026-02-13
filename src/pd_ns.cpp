@@ -65,15 +65,16 @@ void PD_NS_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, dou
     double inv_VH = 1.0 / V_H_;
     int N = grid.N_total;
 
-    // Density diffusion uses the same PD Laplacian coefficient
     double dens_diff_coeff = beta_lap_ * D_v;
 
     #pragma omp parallel for schedule(dynamic, 256)
     for (int i = 0; i < N; ++i) {
         NodeType nt = grid.node_type[i];
 
-        // Skip OUTSIDE and prescribed nodes
-        if (nt == OUTSIDE || nt == INLET || nt == OUTLET) {
+        // Only compute PD for FLUID nodes.
+        // All other node types (WALL, SOLID_MG, INLET, OUTLET, OUTSIDE)
+        // have their values set by boundary conditions, not PD evolution.
+        if (nt != FLUID) {
             fields.rho_new[i] = fields.rho[i];
             fields.vel_new[i] = fields.vel[i];
             continue;
@@ -127,15 +128,13 @@ void PD_NS_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, dou
                 mom_pres[d] += (p_j - p_i) * e_ij[d] * inv_xi * V_j;
             }
 
-            // --- Viscous term: FULL PD Laplacian of velocity ---
-            // mu * nabla^2(v) = mu * beta_lap * sum_j [(v_j - v_i)/|xi|^2] V_j
-            // Uses the scalar Laplacian coefficient applied component-wise.
+            // --- Viscous term: PD Laplacian of velocity ---
             for (int d = 0; d < DIM; ++d) {
                 mom_visc[d] += (vel_j[d] - vel_i[d]) * inv_xi2 * V_j;
             }
         }
 
-        // Update density (FLUID, WALL, SOLID_MG all evolve)
+        // Update density
         double rho_new = rho_i + dt * (
             -(alpha_ * inv_VH) * mass_conv
             + mass_diff
@@ -146,19 +145,14 @@ void PD_NS_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, dou
         if (rho_new > 2.0 * cfg.rho_f) rho_new = 2.0 * cfg.rho_f;
         fields.rho_new[i] = rho_new;
 
-        // Update velocity only for FLUID nodes
-        if (nt == FLUID) {
-            double inv_rho = 1.0 / rho_i;
-            for (int d = 0; d < DIM; ++d) {
-                fields.vel_new[i][d] = vel_i[d] + dt * inv_rho * (
-                    -(alpha_ * inv_VH) * mom_conv[d]
-                    -(alpha_ * inv_VH) * mom_pres[d]
-                    + mu * beta_lap_ * mom_visc[d]
-                );
-            }
-        } else {
-            // WALL and SOLID_MG: velocity enforced by BCs
-            fields.vel_new[i] = fields.vel[i];
+        // Update velocity
+        double inv_rho = 1.0 / rho_i;
+        for (int d = 0; d < DIM; ++d) {
+            fields.vel_new[i][d] = vel_i[d] + dt * inv_rho * (
+                -(alpha_ * inv_VH) * mom_conv[d]
+                -(alpha_ * inv_VH) * mom_pres[d]
+                + mu * beta_lap_ * mom_visc[d]
+            );
         }
     }
 }
@@ -179,14 +173,14 @@ int PD_NS_Solver::solve_steady(Fields& fields, const Grid& grid, const Config& c
         // Apply boundary conditions before step
         apply_inlet_bc(fields, grid, cfg);
         apply_outlet_bc(fields, grid, cfg);
-        apply_wall_bc(fields, grid);
+        apply_wall_bc(fields, grid, cfg);
         apply_solid_surface_bc(fields, grid);
 
         // One timestep
         step(fields, grid, cfg, dt);
 
-        // Apply BCs to new fields (wall mirroring)
-        apply_wall_bc_new(fields, grid);
+        // Apply BCs to new fields (wall mirroring of vel_new, rho_new)
+        apply_wall_bc_new(fields, grid, cfg);
 
         // Convergence check
         if (iter <= 10 || iter % 100 == 0) {
@@ -253,15 +247,12 @@ int PD_NS_Solver::solve_steady(Fields& fields, const Grid& grid, const Config& c
                     cfg.flow_max_iters, epsilon);
     }
 
-    // Poiseuille validation: compare with analytical profile at mid-section
+    // Poiseuille validation: compare with analytical profile at upstream section
     if (!diverged) {
-        // Find a cross-section at y = L_wire/2 (mid pin) or y = -L_upstream/2 (upstream)
-        // For validation, use the upstream section where there's no pin
         double y_check = -cfg.L_upstream / 2.0;
         double err_sum = 0.0, norm_sum = 0.0;
         int n_check = 0;
 
-        // For 2D channel: v_analytical(x) = (3/2)*U_in*(1 - (x/R_tube)^2)
         for (int i = 0; i < N; ++i) {
             if (grid.node_type[i] != FLUID) continue;
             double py = (DIM == 2) ? grid.pos[i][1] : grid.pos[i][2];
@@ -272,7 +263,7 @@ int PD_NS_Solver::solve_steady(Fields& fields, const Grid& grid, const Config& c
                 double r_norm = px / cfg.R_tube;
                 if (std::abs(r_norm) > 1.0) continue;
                 double v_analytical = 1.5 * cfg.U_in * (1.0 - r_norm * r_norm);
-                double v_numerical = fields.vel[i][1]; // axial velocity
+                double v_numerical = fields.vel[i][1];
                 err_sum += (v_numerical - v_analytical) * (v_numerical - v_analytical);
                 norm_sum += v_analytical * v_analytical;
                 n_check++;

@@ -7,34 +7,35 @@
 #include <iomanip>
 #include <sys/stat.h>
 
-std::string CoupledSolver::make_filename(const Config& cfg, const std::string& prefix, int frame) {
+std::string CoupledSolver::make_filename(const Config& cfg, const std::string& prefix,
+                                          double time_s, int frame) {
     std::ostringstream ss;
-    ss << cfg.output_dir << "/" << prefix << "_"
-       << std::setw(6) << std::setfill('0') << frame << ".vti";
+    ss << cfg.output_dir << "/" << prefix
+       << "_" << std::setw(6) << std::setfill('0') << frame
+       << "_t" << std::fixed << std::setprecision(1) << time_s << "s.vti";
     return ss.str();
 }
 
 void CoupledSolver::write_diagnostics(const Grid& grid, const Fields& fields,
                                        double t_corr, const Config& cfg) {
     int solid_count = 0;
+    double C_solid_sum = 0.0;
     int N = grid.N_total;
-    double C_total = 0.0;
 
     for (int i = 0; i < N; ++i) {
-        if (grid.node_type[i] == SOLID_MG) solid_count++;
-        C_total += fields.C[i];
+        if (grid.node_type[i] == SOLID_MG) {
+            solid_count++;
+            C_solid_sum += fields.C[i];
+        }
     }
 
-    // Node-based volume loss: fraction of dissolved nodes
-    double VL_node = 1.0 - static_cast<double>(solid_count) /
-                     static_cast<double>(initial_solid_count_ + 1);
+    // Pin mass loss: fraction of initial solid mass that has been lost
+    // Initial mass ~ initial_solid_count * C_solid_init (= 1.0)
+    // Current mass ~ sum(C[solid_nodes])  +  dissolved_nodes*0
+    double pin_mass_loss = (1.0 - C_solid_sum / (initial_solid_count_ + 1e-30)) * 100.0;
+    if (pin_mass_loss < 0.0) pin_mass_loss = 0.0;
 
-    // Mass-based volume loss: 1 - (sum C(t)) / (sum C(0))
-    // This tracks the integral of concentration over the entire domain
-    double VL_mass = 1.0 - C_total / (initial_C_total_ + 1e-30);
-    if (VL_mass < 0.0) VL_mass = 0.0; // can happen if concentration is produced
-
-    // Max velocity in fluid
+    // Max velocity and concentration in fluid
     double v_max = 0.0;
     double C_max = 0.0;
     for (int i = 0; i < N; ++i) {
@@ -45,34 +46,35 @@ void CoupledSolver::write_diagnostics(const Grid& grid, const Fields& fields,
         }
     }
 
-    std::printf("  t=%.1f s (%.2f h)  VL_node=%.2f%%  VL_mass=%.2f%%  solid=%d  v_max=%.3e  C_max=%.4f\n",
-                t_corr, t_corr / 3600.0, VL_node * 100.0, VL_mass * 100.0,
+    std::printf("  t=%.1f s (%.2f h)  pin_mass_loss=%.2f%%  solid=%d  v_max=%.3e  C_max_fluid=%.4f\n",
+                t_corr, t_corr / 3600.0, pin_mass_loss,
                 solid_count, v_max, C_max);
 
-    // Append to diagnostics CSV
+    // Append to diagnostics CSV (opened in append mode; header written by init_csv_files)
     std::string csv_path = cfg.output_dir + "/diagnostics.csv";
-    static bool header_written = false;
     std::ofstream csv(csv_path, std::ios::app);
-    if (!header_written) {
-        csv << "time_s,time_h,VL_node_pct,VL_mass_pct,solid_nodes,v_max,C_max\n";
-        header_written = true;
-    }
     csv << std::scientific << std::setprecision(6)
         << t_corr << "," << t_corr / 3600.0 << ","
-        << VL_node * 100.0 << "," << VL_mass * 100.0 << ","
+        << pin_mass_loss << ","
         << solid_count << "," << v_max << "," << C_max << "\n";
 
-    // Also append to a simple volume_loss.csv for easy plotting
-    std::string vl_path = cfg.output_dir + "/volume_loss.csv";
-    static bool vl_header_written = false;
-    std::ofstream vl(vl_path, std::ios::app);
-    if (!vl_header_written) {
-        vl << "time_h,VL_node_pct,VL_mass_pct\n";
-        vl_header_written = true;
+    // Simple mass loss CSV for easy plotting
+    std::string ml_path = cfg.output_dir + "/mass_loss.csv";
+    std::ofstream ml(ml_path, std::ios::app);
+    ml << std::fixed << std::setprecision(6)
+       << t_corr / 3600.0 << "," << pin_mass_loss << "\n";
+}
+
+// Initialize CSV files with headers (truncates any stale data from previous runs)
+static void init_csv_files(const Config& cfg) {
+    {
+        std::ofstream csv(cfg.output_dir + "/diagnostics.csv", std::ios::trunc);
+        csv << "time_s,time_h,pin_mass_loss_pct,solid_nodes,v_max,C_max_fluid\n";
     }
-    vl << std::fixed << std::setprecision(6)
-       << t_corr / 3600.0 << "," << VL_node * 100.0 << ","
-       << VL_mass * 100.0 << "\n";
+    {
+        std::ofstream ml(cfg.output_dir + "/mass_loss.csv", std::ios::trunc);
+        ml << "time_h,pin_mass_loss_pct\n";
+    }
 }
 
 void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
@@ -81,42 +83,46 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
     // Create output directory
     mkdir(cfg.output_dir.c_str(), 0755);
 
-    // Count initial solid nodes and total initial concentration
+    // Initialize CSV files (truncates old data)
+    init_csv_files(cfg);
+
+    // Count initial solid nodes
     initial_solid_count_ = 0;
-    initial_C_total_ = 0.0;
     for (int i = 0; i < grid.N_total; ++i) {
         if (grid.node_type[i] == SOLID_MG) initial_solid_count_++;
-        initial_C_total_ += fields.C[i];
     }
     std::printf("Initial solid nodes: %d\n", initial_solid_count_);
-    std::printf("Initial total concentration: %.4f\n", initial_C_total_);
 
     // Initialize solvers
     flow_solver_.init(grid, cfg);
     ard_solver_.init(grid, cfg);
 
-    // Write initial state
-    std::string fname = make_filename(cfg, "state", frame_count_);
+    // Write initial state (this goes into PVD)
+    std::string fname = make_filename(cfg, "state", 0.0, frame_count_);
     writer_.write(fname, grid, fields, cfg);
     writer_.add_timestep(0.0, fname);
     frame_count_++;
 
     double t_corr = 0.0;
     int cycle = 0;
+    bool need_flow_solve = true; // always solve flow on first cycle
 
     while (t_corr < cfg.T_final) {
         cycle++;
         std::printf("\n=== Coupling cycle %d, t=%.1f s (%.2f h) ===\n",
                     cycle, t_corr, t_corr / 3600.0);
 
-        // Phase 1: Solve flow to steady state
-        int flow_iters = flow_solver_.solve_steady(fields, grid, cfg);
+        // Phase 1: Solve flow to steady state (only when geometry changed)
+        if (need_flow_solve) {
+            flow_solver_.solve_steady(fields, grid, cfg);
 
-        // Write flow solution
-        fname = make_filename(cfg, "flow", frame_count_);
-        writer_.write(fname, grid, fields, cfg);
-        writer_.add_timestep(t_corr, fname);
-        frame_count_++;
+            // Write flow solution (for debugging only — NOT added to PVD)
+            fname = make_filename(cfg, "flow", t_corr, frame_count_);
+            writer_.write(fname, grid, fields, cfg);
+            frame_count_++;
+        } else {
+            std::printf("  Skipping flow solve (no dissolution in previous cycle)\n");
+        }
 
         // Phase 2: Corrosion with frozen velocity field
         double dt_corr = ard_solver_.compute_dt(fields, grid, cfg);
@@ -126,16 +132,20 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
             // Apply concentration BCs
             apply_inlet_bc(fields, grid, cfg);
             apply_outlet_bc(fields, grid, cfg);
+            apply_wall_concentration_bc(fields, grid);
 
             ard_solver_.step(fields, grid, cfg, dt_corr);
 
             // Swap C buffer
             std::swap(fields.C, fields.C_new);
 
+            // Smooth concentration near inlet/outlet to fix PD truncation artifacts
+            smooth_boundary_concentration(fields, grid, cfg);
+
             t_corr += dt_corr;
 
             if (step % cfg.output_every_corr == 0) {
-                fname = make_filename(cfg, "corr", frame_count_);
+                fname = make_filename(cfg, "corr", t_corr, frame_count_);
                 writer_.write(fname, grid, fields, cfg);
                 writer_.add_timestep(t_corr, fname);
                 frame_count_++;
@@ -147,18 +157,18 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
 
         // Phase 3: Check dissolution
         int n_dissolved = ard_solver_.apply_phase_change(fields, grid, cfg);
+        need_flow_solve = (n_dissolved > 0);
         if (n_dissolved > 0) {
             std::printf("  Phase change: %d nodes dissolved\n", n_dissolved);
             update_node_types_after_dissolution(grid, fields);
 
-            // Rebuild neighbor list if significant changes
             if (n_dissolved > 10) {
                 std::printf("  Rebuilding neighbor list...\n");
                 grid.build_neighbors();
             }
+        } else {
+            std::printf("  No phase changes this cycle\n");
         }
-
-        write_diagnostics(grid, fields, t_corr, cfg);
 
         // Check if all solid has dissolved
         int solid_remaining = 0;
@@ -173,7 +183,7 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
     }
 
     // Write final state
-    fname = make_filename(cfg, "final", frame_count_);
+    fname = make_filename(cfg, "final", t_corr, frame_count_);
     writer_.write(fname, grid, fields, cfg);
     writer_.add_timestep(t_corr, fname);
 

@@ -34,6 +34,7 @@ struct Config {
     double C_liquid_init = 0.0;
     double C_thresh = 0.2;
     double w_advect = 0.8;
+    double alpha_art_diff = 0.1;  // artificial diffusion: D_art = alpha * |v| * dx
 
     // Grain structure
     double grain_size_mean = 40.0e-6;
@@ -45,7 +46,8 @@ struct Config {
     double gb_corr_factor = 3.0;   // grain boundary corrosion enhancement factor
 
     // Time stepping
-    double cfl_factor = 0.25;
+    double cfl_factor = 0.25;       // CFL for flow solver
+    double cfl_factor_corr = 0.25;  // CFL for corrosion/ARD solver (can be larger)
 
     // Coupling
     int flow_max_iters = 50000;

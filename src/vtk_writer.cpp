@@ -3,10 +3,32 @@
 #include <cstdio>
 #include <sstream>
 #include <iomanip>
+#include <cmath>
+
+static inline double safe_val(double v) {
+    if (std::isnan(v) || std::isinf(v)) return 0.0;
+    // Flush subnormal/denormalized values to zero — they produce
+    // 3-digit exponents (e.g. 5.4e-323) that break some VTK parsers.
+    if (v != 0.0 && std::abs(v) < 1e-300) return 0.0;
+    return v;
+}
 
 void VTKWriter::write(const std::string& filename,
                       const Grid& grid, const Fields& fields,
                       const Config& cfg) {
+    // Check for NaN and report
+    int nan_count = 0;
+    for (int i = 0; i < grid.N_total; ++i) {
+        for (int d = 0; d < DIM; ++d) {
+            if (std::isnan(fields.vel[i][d])) { nan_count++; break; }
+        }
+        if (std::isnan(fields.rho[i]) || std::isnan(fields.C[i]) ||
+            std::isnan(fields.pressure[i])) nan_count++;
+    }
+    if (nan_count > 0) {
+        std::fprintf(stderr, "WARNING: %d NaN values detected when writing %s\n",
+                     nan_count, filename.c_str());
+    }
     std::ofstream out(filename);
     if (!out.is_open()) {
         std::fprintf(stderr, "Error: Cannot open VTI file '%s'\n", filename.c_str());
@@ -31,37 +53,45 @@ void VTKWriter::write(const std::string& filename,
     out << "      <PointData Scalars=\"phase\" Vectors=\"velocity\">\n";
 
     // Velocity (always 3-component for VTK)
+    // WALL and OUTSIDE nodes are fictitious: zero them for clean visualization.
     out << "        <DataArray type=\"Float64\" Name=\"velocity\" "
         << "NumberOfComponents=\"3\" format=\"ascii\">\n";
     int N = grid.N_total;
     for (int i = 0; i < N; ++i) {
+        bool fictitious = (grid.node_type[i] == WALL || grid.node_type[i] == OUTSIDE);
         if constexpr (DIM == 2) {
-            out << "          " << fields.vel[i][0] << " " << fields.vel[i][1] << " 0\n";
+            out << "          "
+                << (fictitious ? 0.0 : safe_val(fields.vel[i][0])) << " "
+                << (fictitious ? 0.0 : safe_val(fields.vel[i][1])) << " 0\n";
         } else {
-            out << "          " << fields.vel[i][0] << " " << fields.vel[i][1]
-                << " " << fields.vel[i][2] << "\n";
+            out << "          "
+                << (fictitious ? 0.0 : safe_val(fields.vel[i][0])) << " "
+                << (fictitious ? 0.0 : safe_val(fields.vel[i][1])) << " "
+                << (fictitious ? 0.0 : safe_val(fields.vel[i][2])) << "\n";
         }
     }
     out << "        </DataArray>\n";
 
     // Pressure
+    // WALL and OUTSIDE: zero for clean visualization
     out << "        <DataArray type=\"Float64\" Name=\"pressure\" format=\"ascii\">\n";
     for (int i = 0; i < N; ++i) {
-        out << "          " << fields.pressure[i] << "\n";
+        bool fictitious = (grid.node_type[i] == WALL || grid.node_type[i] == OUTSIDE);
+        out << "          " << (fictitious ? 0.0 : safe_val(fields.pressure[i])) << "\n";
     }
     out << "        </DataArray>\n";
 
     // Density
     out << "        <DataArray type=\"Float64\" Name=\"density\" format=\"ascii\">\n";
     for (int i = 0; i < N; ++i) {
-        out << "          " << fields.rho[i] << "\n";
+        out << "          " << safe_val(fields.rho[i]) << "\n";
     }
     out << "        </DataArray>\n";
 
     // Concentration
     out << "        <DataArray type=\"Float64\" Name=\"concentration\" format=\"ascii\">\n";
     for (int i = 0; i < N; ++i) {
-        out << "          " << fields.C[i] << "\n";
+        out << "          " << safe_val(fields.C[i]) << "\n";
     }
     out << "        </DataArray>\n";
 
@@ -89,7 +119,7 @@ void VTKWriter::write(const std::string& filename,
     // Diffusivity map
     out << "        <DataArray type=\"Float64\" Name=\"D_map\" format=\"ascii\">\n";
     for (int i = 0; i < N; ++i) {
-        out << "          " << fields.D_map[i] << "\n";
+        out << "          " << safe_val(fields.D_map[i]) << "\n";
     }
     out << "        </DataArray>\n";
 
@@ -119,17 +149,30 @@ void VTKWriter::write_pvd(const std::string& filename) const {
         return;
     }
 
+    // Get directory of PVD file for relative path computation
+    std::string pvd_dir;
+    auto slash_pos = filename.find_last_of('/');
+    if (slash_pos != std::string::npos) {
+        pvd_dir = filename.substr(0, slash_pos + 1); // includes trailing /
+    }
+
     out << "<?xml version=\"1.0\"?>\n";
     out << "<VTKFile type=\"Collection\" version=\"1.0\" byte_order=\"LittleEndian\">\n";
     out << "  <Collection>\n";
 
     for (auto& entry : pvd_entries_) {
+        // Make VTI path relative to PVD file location
+        std::string rel_path = entry.file;
+        if (!pvd_dir.empty() && rel_path.find(pvd_dir) == 0) {
+            rel_path = rel_path.substr(pvd_dir.size());
+        }
         out << "    <DataSet timestep=\"" << std::scientific << std::setprecision(6)
-            << entry.time << "\" file=\"" << entry.file << "\"/>\n";
+            << entry.time << "\" file=\"" << rel_path << "\"/>\n";
     }
 
     out << "  </Collection>\n";
     out << "</VTKFile>\n";
 
     out.close();
+    std::printf("  Wrote PVD file: %s (%zu timesteps)\n", filename.c_str(), pvd_entries_.size());
 }

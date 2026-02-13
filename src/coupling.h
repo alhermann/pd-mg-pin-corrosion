@@ -16,10 +16,10 @@ private:
     VTKWriter writer_;
 
     int initial_solid_count_ = 0;
-    double initial_C_total_ = 0.0;  // sum of initial concentration (for mass-based VL)
     int frame_count_ = 0;
 
-    std::string make_filename(const Config& cfg, const std::string& prefix, int frame);
+    std::string make_filename(const Config& cfg, const std::string& prefix,
+                              double time_s, int frame);
     void write_diagnostics(const Grid& grid, const Fields& fields, double t_corr,
                            const Config& cfg);
 };

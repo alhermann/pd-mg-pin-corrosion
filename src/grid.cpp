@@ -4,28 +4,22 @@
 #include <omp.h>
 
 bool Grid::in_wire(double x, double y, double z) const {
-    // Wire is a cylinder along z-axis (or the last axis in 2D)
-    // 2D: x = radial (r), y = axial (z). Wire: |x| <= R_wire, 0 <= y <= L_wire
-    // 3D: Wire: x^2+y^2 <= R_wire^2, 0 <= z <= L_wire
-    // We use the stored origin to get absolute coordinates
-    // But pos[] already stores absolute positions, so caller passes those directly
     if constexpr (DIM == 2) {
         (void)z;
-        // x = radial, y = axial
-        return (std::abs(x) <= 40.0e-6) && (y >= 0.0) && (y <= 400.0e-6);
+        return (std::abs(x) <= R_wire) && (y >= 0.0) && (y <= L_wire);
     } else {
         double r2 = x * x + y * y;
-        return (r2 <= 40.0e-6 * 40.0e-6) && (z >= 0.0) && (z <= 400.0e-6);
+        return (r2 <= R_wire * R_wire) && (z >= 0.0) && (z <= L_wire);
     }
 }
 
 bool Grid::in_tube(double x, double y, double z) const {
     if constexpr (DIM == 2) {
         (void)z;
-        return std::abs(x) <= 150.0e-6;
+        return std::abs(x) <= R_tube;
     } else {
         double r2 = x * x + y * y;
-        return r2 <= 150.0e-6 * 150.0e-6;
+        return r2 <= R_tube * R_tube;
     }
 }
 
@@ -33,6 +27,9 @@ void Grid::build(const Config& cfg) {
     dx = cfg.dx;
     delta = cfg.delta;
     m = cfg.m_ratio;
+    R_wire = cfg.R_wire;
+    L_wire = cfg.L_wire;
+    R_tube = cfg.R_tube;
 
     // Domain extents
     double z_min = -cfg.L_upstream - m * dx;   // ghost region upstream
@@ -103,13 +100,25 @@ void Grid::build(const Config& cfg) {
         double z_phys_min = -cfg.L_upstream;
         double z_phys_max = cfg.L_wire + cfg.L_downstream;
 
-        // Ghost layers for inlet/outlet
+        // Ghost layers for inlet/outlet (only within tube cross-section)
         if (axial < z_phys_min) {
-            node_type[n] = INLET;
+            if (radial <= cfg.R_tube) {
+                node_type[n] = INLET;
+            } else if (radial <= cfg.R_tube + m * dx + 0.5 * dx) {
+                node_type[n] = WALL;
+            } else {
+                node_type[n] = OUTSIDE;
+            }
         } else if (axial > z_phys_max) {
-            node_type[n] = OUTLET;
+            if (radial <= cfg.R_tube) {
+                node_type[n] = OUTLET;
+            } else if (radial <= cfg.R_tube + m * dx + 0.5 * dx) {
+                node_type[n] = WALL;
+            } else {
+                node_type[n] = OUTSIDE;
+            }
         }
-        // Inside tube?
+        // Inside physical domain, inside tube?
         else if (radial <= cfg.R_tube) {
             // Check if inside wire
             bool wire;

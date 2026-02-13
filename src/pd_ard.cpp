@@ -28,11 +28,12 @@ double PD_ARD_Solver::compute_dt(const Fields& fields, const Grid& grid, const C
         }
     }
 
-    double dt_diff = 0.25 * cfg.dx * cfg.dx / (D_max + 1e-30);
+    // Include artificial diffusion in stability limit
+    double D_eff_max = D_max + cfg.alpha_art_diff * v_max * cfg.dx;
+    double dt_diff = 0.25 * cfg.dx * cfg.dx / (D_eff_max + 1e-30);
     double dt_adv = cfg.dx / (v_max + 1e-30);
-    // Also consider k_corr stability: dt * k_corr < 0.5
     double dt_corr = 0.5 / (cfg.k_corr * cfg.gb_corr_factor + 1e-30);
-    double dt = cfg.cfl_factor * std::min({dt_diff, dt_adv, dt_corr});
+    double dt = cfg.cfl_factor_corr * std::min({dt_diff, dt_adv, dt_corr});
     return dt;
 }
 
@@ -45,7 +46,7 @@ void PD_ARD_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, do
     for (int i = 0; i < N; ++i) {
         NodeType nt = grid.node_type[i];
 
-        // Skip wall, inlet, outlet, outside
+        // Skip wall, inlet, outlet, outside — values set by BCs
         if (nt == WALL || nt == INLET || nt == OUTLET || nt == OUTSIDE) {
             fields.C_new[i] = fields.C[i];
             continue;
@@ -56,56 +57,49 @@ void PD_ARD_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, do
 
         if (nt == SOLID_MG) {
             // ============================================
-            // SOLID NODE: internal diffusion + surface dissolution
+            // SOLID NODE: surface dissolution only (no PD)
             // ============================================
-            // 1) PD diffusion ONLY with other solid neighbors (within-solid transport)
-            // 2) Surface dissolution: k_corr source term proportional to fluid exposure
-            double diff_sum = 0.0;
+            // Solid C represents structural integrity (1=intact, 0=corroded).
+            // Only surface nodes (those exposed to fluid) dissolve.
             int n_fluid_nbr = 0;
             int n_total_nbr = 0;
 
             for (int jj = grid.nbr_offset[i]; jj < grid.nbr_offset[i + 1]; ++jj) {
                 int j = grid.nbr_index[jj];
-                double V_j = grid.nbr_vol[jj];
-                if (V_j < 1e-30) continue;
-
+                if (grid.nbr_vol[jj] < 1e-30) continue;
                 n_total_nbr++;
-
-                if (grid.node_type[j] == SOLID_MG) {
-                    // Solid-solid diffusion (within-grain transport)
-                    double xi = grid.nbr_dist[jj];
-                    double inv_xi2 = 1.0 / (xi * xi);
-                    double D_j = fields.D_map[j];
-                    // Harmonic mean for diffusivity (rate-limited by slower side)
-                    double D_avg = 2.0 * D_i * D_j / (D_i + D_j + 1e-30);
-                    double C_j = fields.C[j];
-                    diff_sum += beta_coeff_ * D_avg * (C_j - C_i) * inv_xi2 * V_j;
-                } else if (grid.node_type[j] == FLUID) {
-                    n_fluid_nbr++;
-                }
+                if (grid.node_type[j] == FLUID) n_fluid_nbr++;
             }
 
-            // Surface dissolution: concentration decreases proportional to fluid exposure
             double f_exposure = (n_total_nbr > 0) ?
                 static_cast<double>(n_fluid_nbr) / static_cast<double>(n_total_nbr) : 0.0;
 
-            // Corrosion rate: higher at grain boundaries
             double k_eff = cfg.k_corr;
             if (fields.is_gb[i]) {
                 k_eff *= cfg.gb_corr_factor;
             }
 
-            fields.C_new[i] = C_i + dt * (diff_sum - k_eff * f_exposure);
+            fields.C_new[i] = C_i - dt * k_eff * f_exposure;
+            if (fields.C_new[i] < 0.0) fields.C_new[i] = 0.0;
+            continue;
 
         } else {
             // ============================================
-            // FLUID NODE: full PD advection-diffusion
+            // FLUID NODE: PD advection-diffusion
             // ============================================
+            // PD transport is computed ONLY over fluid-type bonds
+            // (FLUID, INLET, OUTLET). Bonds to SOLID_MG and WALL
+            // are skipped for transport; instead, a dissolution
+            // source term accounts for mass entering from the pin.
             Vec vel_i = fields.vel[i];
+            double vi_mag = norm(vel_i);
 
             double diff_sum = 0.0;
             double adv_down = 0.0;
             double adv_up = 0.0;
+            double diss_k_sum = 0.0;
+            int n_total_nbr = 0;
+            int n_solid_nbr = 0;
 
             for (int jj = grid.nbr_offset[i]; jj < grid.nbr_offset[i + 1]; ++jj) {
                 int j = grid.nbr_index[jj];
@@ -114,7 +108,23 @@ void PD_ARD_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, do
                 double V_j = grid.nbr_vol[jj];
 
                 if (V_j < 1e-30) continue;
+                n_total_nbr++;
 
+                NodeType nt_j = grid.node_type[j];
+
+                // --- Dissolution source: count solid neighbours ---
+                if (nt_j == SOLID_MG) {
+                    n_solid_nbr++;
+                    double k_j = cfg.k_corr;
+                    if (fields.is_gb[j]) k_j *= cfg.gb_corr_factor;
+                    diss_k_sum += k_j;
+                    continue; // no PD bond to solid
+                }
+
+                // Skip WALL and OUTSIDE for transport
+                if (nt_j == WALL || nt_j == OUTSIDE) continue;
+
+                // --- PD bonds: FLUID, INLET, OUTLET ---
                 double C_j = fields.C[j];
                 double D_j = fields.D_map[j];
                 Vec vel_j = fields.vel[j];
@@ -122,30 +132,40 @@ void PD_ARD_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, do
                 double inv_xi = 1.0 / xi;
                 double inv_xi2 = inv_xi * inv_xi;
 
-                // --- Diffusion (PD Laplacian) ---
-                // Use harmonic mean for D across different materials
+                // Diffusion (PD Laplacian) with artificial diffusion for stability
+                // D_art = alpha * max(|v_i|, |v_j|) * dx  (streamline upwind stabilization)
+                // This reduces Pe_eff from ~1180 to ~1/alpha (~10)
                 double D_avg = 2.0 * D_i * D_j / (D_i + D_j + 1e-30);
-                diff_sum += beta_coeff_ * D_avg * (C_j - C_i) * inv_xi2 * V_j;
+                double vj_mag = norm(vel_j);
+                double D_art = cfg.alpha_art_diff * std::max(vi_mag, vj_mag) * cfg.dx;
+                diff_sum += beta_coeff_ * (D_avg + D_art) * (C_j - C_i) * inv_xi2 * V_j;
 
-                // --- Advection (PD divergence of C*v) ---
+                // Advection (PD divergence of C*v)
                 double vi_dot_e = dot(vel_i, e_ij);
                 double vj_dot_e = dot(vel_j, e_ij);
 
-                // Downwind
                 adv_down += (C_j * vj_dot_e - C_i * vi_dot_e) * inv_xi * V_j;
-
-                // Upwind (reverse direction)
                 adv_up += (C_j * (-vj_dot_e) - C_i * (-vi_dot_e)) * inv_xi * V_j;
             }
 
             double adv_sum = div_coeff * (w * adv_down + (1.0 - w) * adv_up);
 
-            fields.C_new[i] = C_i + dt * (diff_sum - adv_sum);
+            // Dissolution source: dissolved Mg entering fluid from solid surface
+            double source = 0.0;
+            if (n_solid_nbr > 0 && n_total_nbr > 0) {
+                double avg_k = diss_k_sum / n_solid_nbr;
+                double interface_frac = static_cast<double>(n_solid_nbr) /
+                                        static_cast<double>(n_total_nbr);
+                source = avg_k * interface_frac * (cfg.rho_m / cfg.rho_f);
+            }
+
+            fields.C_new[i] = C_i + dt * (diff_sum - adv_sum + source);
         }
 
-        // Clamp concentration
-        if (fields.C_new[i] < 0.0) fields.C_new[i] = 0.0;
-        if (fields.C_new[i] > 1.5) fields.C_new[i] = 1.5;
+        // Clamp concentration to physical range [0, 1]
+        // Use 1e-30 floor to avoid subnormal floating-point values
+        if (fields.C_new[i] < 1e-30) fields.C_new[i] = 0.0;
+        if (fields.C_new[i] > 1.0) fields.C_new[i] = 1.0;
     }
 }
 
@@ -161,6 +181,8 @@ int PD_ARD_Solver::apply_phase_change(Fields& fields, Grid& grid, const Config& 
                 fields.D_map[i] = cfg.D_liquid;
                 fields.rho[i] = cfg.rho_f;
                 fields.vel[i] = vec_zero();
+                // Newly dissolved node starts with some dissolved Mg concentration
+                fields.C[i] = cfg.C_thresh;
                 n_dissolved++;
             }
         }
