@@ -96,6 +96,13 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
     // Initialize solvers
     flow_solver_.init(grid, cfg);
     ard_solver_.init(grid, cfg);
+    if (cfg.use_implicit) {
+        ard_implicit_solver_.init(grid, cfg);
+        std::printf("Using IMPLICIT ARD solver (dt_max=%.1f s, fraction=%.2f)\n",
+                    cfg.implicit_dt_max, cfg.implicit_dt_fraction);
+    } else {
+        std::printf("Using EXPLICIT ARD solver\n");
+    }
 
     // Write initial state (this goes into PVD)
     std::string fname = make_filename(cfg, "state", 0.0, frame_count_);
@@ -125,38 +132,89 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
         }
 
         // Phase 2: Corrosion with frozen velocity field
-        double dt_corr = ard_solver_.compute_dt(fields, grid, cfg);
-        std::printf("  Corrosion dt = %.4e s\n", dt_corr);
+        if (cfg.use_implicit) {
+            // --- IMPLICIT PATH ---
+            // Assemble PD operator matrix once per coupling cycle
+            ard_implicit_solver_.assemble(fields, grid, cfg);
 
-        for (int step = 1; step <= cfg.corrosion_steps_per_check; ++step) {
-            // Apply concentration BCs
-            apply_inlet_bc(fields, grid, cfg);
-            apply_outlet_bc(fields, grid, cfg);
-            apply_wall_concentration_bc(fields, grid);
+            int implicit_step = 0;
+            double t_cycle_start = t_corr;
+            bool phase_change_imminent = false;
 
-            ard_solver_.step(fields, grid, cfg, dt_corr);
+            while (!phase_change_imminent && t_corr < cfg.T_final) {
+                double dt_impl = ard_implicit_solver_.compute_adaptive_dt(fields, grid, cfg);
 
-            // Swap C buffer
-            std::swap(fields.C, fields.C_new);
+                // Apply concentration BCs
+                apply_inlet_bc(fields, grid, cfg);
+                apply_outlet_bc(fields, grid, cfg);
+                apply_wall_concentration_bc(fields, grid);
 
-            // Smooth concentration near inlet/outlet to fix PD truncation artifacts
-            smooth_boundary_concentration(fields, grid, cfg);
+                int n_newton = ard_implicit_solver_.step(fields, grid, cfg, dt_impl);
 
-            t_corr += dt_corr;
+                smooth_boundary_concentration(fields, grid, cfg);
 
-            if (step % cfg.output_every_corr == 0) {
-                fname = make_filename(cfg, "corr", t_corr, frame_count_);
-                writer_.write(fname, grid, fields, cfg);
-                writer_.add_timestep(t_corr, fname);
-                frame_count_++;
-                write_diagnostics(grid, fields, t_corr, cfg);
+                t_corr += dt_impl;
+                implicit_step++;
+
+                if (implicit_step % cfg.implicit_output_every == 0) {
+                    fname = make_filename(cfg, "corr", t_corr, frame_count_);
+                    writer_.write(fname, grid, fields, cfg);
+                    writer_.add_timestep(t_corr, fname);
+                    frame_count_++;
+                    write_diagnostics(grid, fields, t_corr, cfg);
+                }
+
+                // Check if any solid node is close to phase change
+                double dt_next = ard_implicit_solver_.compute_adaptive_dt(fields, grid, cfg);
+                if (dt_next <= 0.1) {
+                    // Take one final step to push past the dissolution threshold
+                    // instead of fractioning forever (Zeno's paradox fix)
+                    apply_inlet_bc(fields, grid, cfg);
+                    apply_outlet_bc(fields, grid, cfg);
+                    apply_wall_concentration_bc(fields, grid);
+                    ard_implicit_solver_.step(fields, grid, cfg, dt_next);
+                    smooth_boundary_concentration(fields, grid, cfg);
+                    t_corr += dt_next;
+                    implicit_step++;
+                    phase_change_imminent = true;
+                }
             }
 
-            if (t_corr >= cfg.T_final) break;
+            std::printf("  Implicit cycle: %d steps, dt range covers t=%.2f to %.2f s\n",
+                        implicit_step, t_cycle_start, t_corr);
+        } else {
+            // --- EXPLICIT PATH (fallback) ---
+            double dt_corr = ard_solver_.compute_dt(fields, grid, cfg);
+            std::printf("  Corrosion dt = %.4e s\n", dt_corr);
+
+            for (int step = 1; step <= cfg.corrosion_steps_per_check; ++step) {
+                apply_inlet_bc(fields, grid, cfg);
+                apply_outlet_bc(fields, grid, cfg);
+                apply_wall_concentration_bc(fields, grid);
+
+                ard_solver_.step(fields, grid, cfg, dt_corr);
+                std::swap(fields.C, fields.C_new);
+
+                smooth_boundary_concentration(fields, grid, cfg);
+
+                t_corr += dt_corr;
+
+                if (step % cfg.output_every_corr == 0) {
+                    fname = make_filename(cfg, "corr", t_corr, frame_count_);
+                    writer_.write(fname, grid, fields, cfg);
+                    writer_.add_timestep(t_corr, fname);
+                    frame_count_++;
+                    write_diagnostics(grid, fields, t_corr, cfg);
+                }
+
+                if (t_corr >= cfg.T_final) break;
+            }
         }
 
         // Phase 3: Check dissolution
-        int n_dissolved = ard_solver_.apply_phase_change(fields, grid, cfg);
+        int n_dissolved = cfg.use_implicit
+            ? ard_implicit_solver_.apply_phase_change(fields, grid, cfg)
+            : ard_solver_.apply_phase_change(fields, grid, cfg);
         need_flow_solve = (n_dissolved > 0);
         if (n_dissolved > 0) {
             std::printf("  Phase change: %d nodes dissolved\n", n_dissolved);

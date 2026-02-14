@@ -4,6 +4,7 @@
 #include "config.h"
 #include "pd_ns.h"
 #include "pd_ard.h"
+#include "pd_ard_implicit.h"
 #include "vtk_writer.h"
 
 class CoupledSolver {
@@ -13,6 +14,7 @@ public:
 private:
     PD_NS_Solver flow_solver_;
     PD_ARD_Solver ard_solver_;
+    PD_ARD_ImplicitSolver ard_implicit_solver_;
     VTKWriter writer_;
 
     int initial_solid_count_ = 0;

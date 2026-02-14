@@ -75,6 +75,12 @@ void Config::load(const std::string& filename) {
         else if (key == "output_every_flow") output_every_flow = std::stoi(val);
         else if (key == "output_every_corr") output_every_corr = std::stoi(val);
         else if (key == "output_dir")        output_dir = val;
+        else if (key == "use_implicit")          use_implicit = std::stoi(val);
+        else if (key == "implicit_dt_fraction")  implicit_dt_fraction = std::stod(val);
+        else if (key == "implicit_dt_max")       implicit_dt_max = std::stod(val);
+        else if (key == "implicit_output_every") implicit_output_every = std::stoi(val);
+        else if (key == "newton_tol")            newton_tol = std::stod(val);
+        else if (key == "newton_max_iter")       newton_max_iter = std::stoi(val);
         else {
             std::cerr << "Warning: Unknown config key '" << key << "'\n";
         }

@@ -59,6 +59,16 @@ struct Config {
     int output_every_corr = 100;
     std::string output_dir = "output";
 
+    // Implicit ARD solver
+    int use_implicit = 1;               // 1=implicit, 0=explicit (fallback)
+    double implicit_dt_fraction = 0.5;  // fraction of min(t_phase) for adaptive dt
+    double implicit_dt_max = 60.0;      // maximum implicit dt [s]
+    int implicit_output_every = 10;     // VTI output every N implicit steps
+
+    // Newton-Raphson (inside implicit solver)
+    double newton_tol = 1.0e-8;         // relative residual convergence tolerance
+    int newton_max_iter = 20;           // max Newton iterations per implicit step
+
     // Derived (computed after load)
     double delta;       // horizon = m_ratio * dx
     double U_in;        // inlet velocity from Q_flow and geometry

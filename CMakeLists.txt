@@ -24,6 +24,19 @@ endif()
 
 find_package(OpenMP REQUIRED)
 
+# Eigen (header-only) for sparse linear algebra in implicit ARD solver
+include(FetchContent)
+FetchContent_Declare(
+    eigen
+    GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+    GIT_TAG        3.4.0
+    GIT_SHALLOW    TRUE
+)
+set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
+set(EIGEN_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(eigen)
+
 add_executable(pd_corrosion
     src/main.cpp
     src/config.cpp
@@ -31,13 +44,26 @@ add_executable(pd_corrosion
     src/grains.cpp
     src/pd_ns.cpp
     src/pd_ard.cpp
+    src/pd_ard_implicit.cpp
     src/boundary.cpp
     src/coupling.cpp
     src/vtk_writer.cpp
 )
 
 target_compile_definitions(pd_corrosion PRIVATE PD_DIM=${PD_DIM})
-target_link_libraries(pd_corrosion PRIVATE OpenMP::OpenMP_CXX)
+target_link_libraries(pd_corrosion PRIVATE OpenMP::OpenMP_CXX Eigen3::Eigen)
+
+# Test executable for implicit ARD solver validation
+add_executable(test_implicit
+    src/test_implicit.cpp
+    src/config.cpp
+    src/grid.cpp
+    src/pd_ard.cpp
+    src/pd_ard_implicit.cpp
+    src/vtk_writer.cpp
+)
+target_compile_definitions(test_implicit PRIVATE PD_DIM=${PD_DIM})
+target_link_libraries(test_implicit PRIVATE OpenMP::OpenMP_CXX Eigen3::Eigen)
 
 # Release by default
 if(NOT CMAKE_BUILD_TYPE)
