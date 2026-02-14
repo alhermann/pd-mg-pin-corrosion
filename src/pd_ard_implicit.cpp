@@ -18,27 +18,21 @@ void PD_ARD_ImplicitSolver::init(const Grid& grid, const Config& cfg) {
         V_H_ = (4.0 / 3.0) * PI * cfg.delta * cfg.delta * cfg.delta;
         beta_coeff_ = 12.0 / (PI * cfg.delta * cfg.delta);
     }
-
-    // Smoothing width for salt-layer source cutoff.
-    // The dissolution source ramps linearly to zero over [C_sat - eps, C_sat].
-    // 2% of C_sat gives a narrow ramp that's smooth enough for Newton convergence
-    // without significantly altering the physical behavior.
-    eps_sat_ = 0.02 * cfg.C_sat;
 }
 
 // ============================================================================
-// Index map: fluid nodes <-> local unknowns
+// Index map: FLUID and SOLID_MG nodes <-> local unknowns
 // ============================================================================
 
 void PD_ARD_ImplicitSolver::build_index_map(const Grid& grid) {
     int N = grid.N_total;
     global_to_local_.assign(N, -1);
     local_to_global_.clear();
-    local_to_global_.reserve(N / 4);
+    local_to_global_.reserve(N / 2);
 
     int idx = 0;
     for (int i = 0; i < N; ++i) {
-        if (grid.node_type[i] == FLUID) {
+        if (grid.node_type[i] == FLUID || grid.node_type[i] == SOLID_MG) {
             global_to_local_[i] = idx;
             local_to_global_.push_back(i);
             idx++;
@@ -48,7 +42,45 @@ void PD_ARD_ImplicitSolver::build_index_map(const Grid& grid) {
 }
 
 // ============================================================================
-// Assemble linear PD operator matrix M (once per coupling cycle)
+// Precompute salt-layer blocking flags for solid nodes
+// (Jafarzadeh et al. 2018): if a solid node has ANY liquid neighbor with
+// C >= C_sat, all its interface bonds are disabled (dissolution blocked).
+// ============================================================================
+
+void PD_ARD_ImplicitSolver::compute_salt_blocked(const Fields& fields,
+                                                   const Grid& grid,
+                                                   const Config& cfg) {
+    int N = grid.N_total;
+    salt_blocked_.assign(N, false);
+
+    #pragma omp parallel for schedule(dynamic, 256)
+    for (int i = 0; i < N; ++i) {
+        if (grid.node_type[i] != SOLID_MG) continue;
+
+        for (int jj = grid.nbr_offset[i]; jj < grid.nbr_offset[i + 1]; ++jj) {
+            int j = grid.nbr_index[jj];
+            if (grid.nbr_vol[jj] < 1e-30) continue;
+            if (grid.node_type[j] == FLUID && fields.C[j] >= cfg.C_sat) {
+                salt_blocked_[i] = true;
+                break;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Assemble bi-material PD operator matrix M (once per coupling cycle)
+//
+// Bond micro-diffusivities (Jafarzadeh, Chen & Bobaru 2018):
+//   Liquid-Liquid:  D_avg = D_liquid
+//   Solid-Solid:    skipped (no diffusion within bulk solid)
+//   Interface:      D_avg = harmonic_mean(D_liquid, D_solid)
+//                   where D_solid = D_gb if solid node is GB, else D_grain
+//
+// Salt-layer blocking: if a solid node is salt-blocked, all its bonds
+// get D_avg = 0 (dissolution disabled for that node).
+//
+// Advection: only applied when node i is FLUID (solid nodes have v=0).
 // ============================================================================
 
 void PD_ARD_ImplicitSolver::assemble(const Fields& fields, const Grid& grid,
@@ -56,7 +88,18 @@ void PD_ARD_ImplicitSolver::assemble(const Fields& fields, const Grid& grid,
     Timer t_asm("implicit_assemble");
 
     build_index_map(grid);
-    std::printf("  Implicit: %d fluid unknowns\n", n_unknowns_);
+
+    // Count fluid and solid unknowns for logging
+    int n_fluid = 0, n_solid = 0;
+    for (int k = 0; k < n_unknowns_; ++k) {
+        if (grid.node_type[local_to_global_[k]] == FLUID) n_fluid++;
+        else n_solid++;
+    }
+    std::printf("  Implicit: %d unknowns (%d fluid + %d solid)\n",
+                n_unknowns_, n_fluid, n_solid);
+
+    // Precompute salt-layer blocking
+    compute_salt_blocked(fields, grid, cfg);
 
     double div_coeff = alpha_p_ / V_H_;
 
@@ -87,9 +130,18 @@ void PD_ARD_ImplicitSolver::assemble(const Fields& fields, const Grid& grid,
         #pragma omp for schedule(dynamic, 256)
         for (int k = 0; k < n_unknowns_; ++k) {
             int i = local_to_global_[k];
-            double D_i = fields.D_map[i];
-            Vec vel_i = fields.vel[i];
-            double vi_mag = norm(vel_i);
+            NodeType nt_i = grid.node_type[i];
+            bool i_is_fluid = (nt_i == FLUID);
+            bool i_is_solid = (nt_i == SOLID_MG);
+            bool i_is_gb = fields.is_gb[i];
+            bool i_salt_blocked = i_is_solid && salt_blocked_[i];
+
+            // Solid micro-diffusivity for node i
+            double D_solid_i = i_is_gb ? cfg.D_gb : cfg.D_grain;
+
+            // Velocity (only fluid nodes have nonzero velocity)
+            Vec vel_i = i_is_fluid ? fields.vel[i] : vec_zero();
+            double vi_mag = i_is_fluid ? norm(vel_i) : 0.0;
 
             double diag = 0.0;
 
@@ -103,30 +155,70 @@ void PD_ARD_ImplicitSolver::assemble(const Fields& fields, const Grid& grid,
 
                 NodeType nt_j = grid.node_type[j];
 
-                // Skip solid, wall, outside for transport (same as explicit)
-                if (nt_j == SOLID_MG || nt_j == WALL || nt_j == OUTSIDE) continue;
+                // Skip WALL and OUTSIDE — no transport bonds
+                if (nt_j == WALL || nt_j == OUTSIDE) continue;
 
                 double inv_xi = 1.0 / xi;
                 double inv_xi2 = inv_xi * inv_xi;
 
-                // Diffusion weight
-                double D_j = fields.D_map[j];
-                double D_avg = 2.0 * D_i * D_j / (D_i + D_j + 1e-30);
-                double vj_mag = norm(fields.vel[j]);
-                double D_art = cfg.alpha_art_diff * std::max(vi_mag, vj_mag) * cfg.dx;
+                // Bond classification:
+                //   Liquid-Liquid:  D_liquid + advection
+                //   Interface:      harmonic_mean(D_liquid, D_solid) + advection on fluid side
+                //   Solid-Solid:    skip (no transport within solid bulk)
+                bool j_is_fluid = (nt_j == FLUID || nt_j == INLET || nt_j == OUTLET);
+                bool j_is_solid = (nt_j == SOLID_MG);
+
+                // Skip solid-solid bonds (no diffusion within bulk solid)
+                if (i_is_solid && j_is_solid) continue;
+
+                double D_avg = 0.0;
+                if (i_is_fluid && j_is_fluid) {
+                    // Liquid-Liquid bond
+                    D_avg = cfg.D_liquid;
+                } else {
+                    // Interface bond (one fluid, one solid):
+                    // harmonic mean of D_liquid and D_solid
+                    bool solid_is_gb;
+                    bool solid_salt_blocked;
+                    if (i_is_solid) {
+                        solid_is_gb = i_is_gb;
+                        solid_salt_blocked = i_salt_blocked;
+                    } else {
+                        solid_is_gb = fields.is_gb[j];
+                        solid_salt_blocked = salt_blocked_[j];
+                    }
+
+                    // Salt-layer blocking: disable interface bonds for blocked solid nodes
+                    if (solid_salt_blocked) {
+                        D_avg = 0.0;
+                    } else {
+                        double D_s = solid_is_gb ? cfg.D_gb : cfg.D_grain;
+                        D_avg = 2.0 * cfg.D_liquid * D_s / (cfg.D_liquid + D_s + 1e-30);
+                    }
+                }
+
+                // Artificial diffusion (only for liquid-liquid bonds with velocity)
+                double D_art = 0.0;
+                if (i_is_fluid && j_is_fluid) {
+                    double vj_mag = norm(fields.vel[j]);
+                    D_art = cfg.alpha_art_diff * std::max(vi_mag, vj_mag) * cfg.dx;
+                }
+
                 double w_diff = beta_coeff_ * (D_avg + D_art) * inv_xi2 * V_j;
 
-                // Advection weight (non-conservative: v_i . e_ij)
-                double vi_dot_e = dot(vel_i, e_ij);
-                double w_adv = div_coeff * vi_dot_e * inv_xi * V_j;
+                // Advection weight: only when node i is FLUID (solid nodes have v=0)
+                double w_adv = 0.0;
+                if (i_is_fluid) {
+                    double vi_dot_e = dot(vel_i, e_ij);
+                    w_adv = div_coeff * vi_dot_e * inv_xi * V_j;
+                }
 
-                // Total: dC_i/dt += w_ij*(C_j - C_i) where w_ij = w_diff - w_adv
-                // M[k, col_j] = w_ij,  M[k, k] -= w_ij
                 double w_ij = w_diff - w_adv;
 
                 diag -= w_ij;
 
-                if (nt_j == FLUID) {
+                // Off-diagonal entry
+                if (nt_j == FLUID || nt_j == SOLID_MG) {
                     int col_j = global_to_local_[j];
                     if (col_j >= 0) {
                         my_triplets.emplace_back(k, col_j, w_ij);
@@ -182,68 +274,7 @@ void PD_ARD_ImplicitSolver::assemble(const Fields& fields, const Grid& grid,
 }
 
 // ============================================================================
-// Smooth dissolution source and derivative
-// ============================================================================
-
-double PD_ARD_ImplicitSolver::source_val(double C, double base_rate, double C_sat) const {
-    if (base_rate < 1e-30) return 0.0;
-    // Linear ramp: 1 when C <= C_sat - eps, 0 when C >= C_sat
-    double x = (C_sat - C) / eps_sat_;
-    double factor = std::max(0.0, std::min(1.0, x));
-    return base_rate * factor;
-}
-
-double PD_ARD_ImplicitSolver::source_deriv(double C, double base_rate, double C_sat) const {
-    if (base_rate < 1e-30) return 0.0;
-    double gap = C_sat - C;
-    // Derivative is -base_rate/eps inside the ramp, zero outside
-    if (gap > 0.0 && gap < eps_sat_) {
-        return -base_rate / eps_sat_;
-    }
-    return 0.0;
-}
-
-// ============================================================================
-// Precompute dissolution base rates (geometry-dependent, constant during Newton)
-// ============================================================================
-
-void PD_ARD_ImplicitSolver::compute_diss_base_rates(const Fields& fields,
-                                                     const Grid& grid,
-                                                     const Config& cfg) {
-    diss_base_rate_.assign(n_unknowns_, 0.0);
-
-    #pragma omp parallel for schedule(dynamic, 256)
-    for (int k = 0; k < n_unknowns_; ++k) {
-        int i = local_to_global_[k];
-
-        int n_solid_nbr = 0;
-        int n_total_nbr = 0;
-        double diss_k_sum = 0.0;
-
-        for (int jj = grid.nbr_offset[i]; jj < grid.nbr_offset[i + 1]; ++jj) {
-            int j = grid.nbr_index[jj];
-            if (grid.nbr_vol[jj] < 1e-30) continue;
-            n_total_nbr++;
-
-            if (grid.node_type[j] == SOLID_MG) {
-                n_solid_nbr++;
-                double k_j = cfg.k_corr;
-                if (fields.is_gb[j]) k_j *= cfg.gb_corr_factor;
-                diss_k_sum += k_j;
-            }
-        }
-
-        if (n_solid_nbr > 0 && n_total_nbr > 0) {
-            double avg_k = diss_k_sum / n_solid_nbr;
-            double interface_frac = static_cast<double>(n_solid_nbr) /
-                                    static_cast<double>(n_total_nbr);
-            diss_base_rate_[k] = avg_k * interface_frac * (cfg.rho_m / cfg.rho_f);
-        }
-    }
-}
-
-// ============================================================================
-// BC contribution (constant during Newton — inlet/outlet C values don't change)
+// BC contribution (constant during the step — inlet/outlet C values don't change)
 // ============================================================================
 
 void PD_ARD_ImplicitSolver::compute_bc_rhs(Eigen::VectorXd& bc_rhs,
@@ -259,52 +290,15 @@ void PD_ARD_ImplicitSolver::compute_bc_rhs(Eigen::VectorXd& bc_rhs,
 }
 
 // ============================================================================
-// Residual:  R(C) = C - C_old - dt * [ M*C + bc + source(C) ]
-// ============================================================================
-
-void PD_ARD_ImplicitSolver::compute_residual(Eigen::VectorXd& R,
-                                              const Eigen::VectorXd& C,
-                                              const Eigen::VectorXd& C_old,
-                                              const Eigen::VectorXd& bc_rhs,
-                                              double dt, const Config& cfg) const {
-    Eigen::VectorXd MC = M_ * C;
-    R.resize(n_unknowns_);
-
-    for (int k = 0; k < n_unknowns_; ++k) {
-        double src = source_val(C[k], diss_base_rate_[k], cfg.C_sat);
-        R[k] = C[k] - C_old[k] - dt * (MC[k] + bc_rhs[k] + src);
-    }
-}
-
-// ============================================================================
-// Jacobian:  J = I - dt * ( M + diag(dsource/dC) )
-// ============================================================================
-
-void PD_ARD_ImplicitSolver::assemble_jacobian(Eigen::SparseMatrix<double>& J,
-                                               const Eigen::VectorXd& C,
-                                               double dt, const Config& cfg) const {
-    // Start from the linear part: J = -dt * M
-    J = M_;
-    J *= -dt;
-
-    // Add identity and source derivative to diagonal:
-    // J_kk += 1.0 - dt * dsource_k/dC_k
-    for (int k = 0; k < n_unknowns_; ++k) {
-        double ds = source_deriv(C[k], diss_base_rate_[k], cfg.C_sat);
-        J.coeffRef(k, k) += 1.0 - dt * ds;
-    }
-}
-
-// ============================================================================
-// Newton-Raphson step with GMRES inner solve
+// Implicit step: solve (I - dt*M) * C_new = C_old + dt * bc_rhs
+//
+// The bi-material PD system is purely linear (no source term).
+// A single GMRES solve replaces the old Newton iteration.
 // ============================================================================
 
 int PD_ARD_ImplicitSolver::step(Fields& fields, const Grid& grid,
                                  const Config& cfg, double dt) {
-    // Precompute dissolution base rates (depends on solid geometry, not on C)
-    compute_diss_base_rates(fields, grid, cfg);
-
-    // Precompute BC contribution (constant during Newton)
+    // Precompute BC contribution
     Eigen::VectorXd bc_rhs;
     compute_bc_rhs(bc_rhs, fields);
 
@@ -314,117 +308,54 @@ int PD_ARD_ImplicitSolver::step(Fields& fields, const Grid& grid,
         C_old[k] = fields.C[local_to_global_[k]];
     }
 
-    // Initial guess: C = C_old
-    Eigen::VectorXd C = C_old;
-
-    // Compute initial residual
-    Eigen::VectorXd R(n_unknowns_);
-    compute_residual(R, C, C_old, bc_rhs, dt, cfg);
-    double R0_norm = R.norm();
-
-    // If already converged (e.g. steady state, or no source and zero BC)
-    if (R0_norm < 1e-14) {
-        std::printf("    Newton: converged at initial guess (|R|=%.2e)\n", R0_norm);
-        // Still need to update solid nodes below
+    // Build system matrix: A = I - dt * M
+    Eigen::SparseMatrix<double> A = M_;
+    A *= -dt;
+    for (int k = 0; k < n_unknowns_; ++k) {
+        A.coeffRef(k, k) += 1.0;
     }
 
-    // GMRES solver with ILU preconditioner
+    // RHS: b = C_old + dt * bc_rhs
+    Eigen::VectorXd b = C_old + dt * bc_rhs;
+
+    // Solve A * C_new = b with GMRES + ILU preconditioner
     Eigen::GMRES<Eigen::SparseMatrix<double>, Eigen::IncompleteLUT<double>> gmres;
     gmres.setMaxIterations(200);
     gmres.setTolerance(1e-10);
     gmres.set_restart(50);
 
-    Eigen::SparseMatrix<double> J;
-    int newton_iter = 0;
-    int total_gmres_iter = 0;
-
-    for (; newton_iter < cfg.newton_max_iter && R0_norm > 1e-14; ++newton_iter) {
-        double R_norm = R.norm();
-
-        // Convergence check (relative + absolute floor)
-        if (R_norm < cfg.newton_tol * R0_norm + 1e-14) {
-            break;
-        }
-
-        // Assemble Jacobian J = I - dt*(M + diag(dsource/dC))
-        assemble_jacobian(J, C, dt, cfg);
-
-        // Solve J * delta = -R with GMRES + ILU preconditioner
-        gmres.compute(J);
-        if (gmres.info() != Eigen::Success) {
-            std::fprintf(stderr, "WARNING: GMRES preconditioner setup failed at Newton iter %d\n",
-                         newton_iter);
-            break;
-        }
-
-        Eigen::VectorXd delta = gmres.solve(-R);
-        total_gmres_iter += gmres.iterations();
-
-        if (gmres.info() != Eigen::Success) {
-            std::fprintf(stderr, "WARNING: GMRES did not converge at Newton iter %d "
-                         "(%d iters, |res|=%.2e)\n",
-                         newton_iter, (int)gmres.iterations(), gmres.error());
-        }
-
-        // Newton update
-        C += delta;
-
-        // Recompute residual (no clamping during Newton — the smooth source
-        // function handles C near C_sat continuously, and clamping would
-        // break Newton convergence by modifying the iterate inconsistently)
-        compute_residual(R, C, C_old, bc_rhs, dt, cfg);
+    gmres.compute(A);
+    if (gmres.info() != Eigen::Success) {
+        std::fprintf(stderr, "WARNING: GMRES preconditioner setup failed\n");
     }
 
-    std::printf("    Newton: %d iter, |R|=%.2e -> %.2e, GMRES total=%d\n",
-                newton_iter, R0_norm, R.norm(), total_gmres_iter);
+    Eigen::VectorXd C_new = gmres.solve(b);
 
-    // Write solution back to fields
+    if (gmres.info() != Eigen::Success) {
+        std::fprintf(stderr, "WARNING: GMRES did not converge (%d iters, |res|=%.2e)\n",
+                     (int)gmres.iterations(), gmres.error());
+    }
+
+    std::printf("    Linear solve: GMRES %d iters, |res|=%.2e\n",
+                (int)gmres.iterations(), gmres.error());
+
+    // Write solution back to fields with physical clamping [0, C_solid_init]
     for (int k = 0; k < n_unknowns_; ++k) {
         int i = local_to_global_[k];
-        double val = C[k];
-        if (val < 1e-30) val = 0.0;
-        if (val > cfg.C_sat) val = cfg.C_sat;
+        double val = C_new[k];
+        if (val < 0.0) val = 0.0;
+        if (val > cfg.C_solid_init) val = cfg.C_solid_init;
         fields.C[i] = val;
     }
 
-    // Advance solid nodes analytically: C -= k_eff * f_exposure * dt
-    // (uses updated fluid C for salt-layer blocking check)
-    int N = grid.N_total;
-    #pragma omp parallel for schedule(dynamic, 256)
-    for (int i = 0; i < N; ++i) {
-        if (grid.node_type[i] != SOLID_MG) continue;
-
-        int n_fluid_nbr = 0;
-        int n_total_nbr = 0;
-        bool salt_layer_blocked = false;
-
-        for (int jj = grid.nbr_offset[i]; jj < grid.nbr_offset[i + 1]; ++jj) {
-            int j = grid.nbr_index[jj];
-            if (grid.nbr_vol[jj] < 1e-30) continue;
-            n_total_nbr++;
-            if (grid.node_type[j] == FLUID) {
-                n_fluid_nbr++;
-                if (fields.C[j] >= cfg.C_sat) salt_layer_blocked = true;
-            }
-        }
-
-        double f_exposure = (n_total_nbr > 0) ?
-            static_cast<double>(n_fluid_nbr) / static_cast<double>(n_total_nbr) : 0.0;
-
-        double k_eff = cfg.k_corr;
-        if (fields.is_gb[i]) k_eff *= cfg.gb_corr_factor;
-        if (salt_layer_blocked) k_eff = 0.0;
-
-        double C_new_val = fields.C[i] - dt * k_eff * f_exposure;
-        if (C_new_val < 0.0) C_new_val = 0.0;
-        fields.C[i] = C_new_val;
-    }
-
-    return newton_iter;
+    return 1; // single linear solve (replaces Newton iteration count)
 }
 
 // ============================================================================
-// Adaptive dt: fraction of time until fastest surface node reaches C_thresh
+// Adaptive dt: based on PD diffusion flux at solid interface nodes
+//
+// For each solid node at the interface, estimate the dissolution rate from
+// the assembled M matrix row, then compute time to reach C_thresh.
 // ============================================================================
 
 double PD_ARD_ImplicitSolver::compute_adaptive_dt(const Fields& fields,
@@ -436,29 +367,32 @@ double PD_ARD_ImplicitSolver::compute_adaptive_dt(const Fields& fields,
     #pragma omp parallel for reduction(min:min_t_phase) schedule(dynamic, 256)
     for (int i = 0; i < N; ++i) {
         if (grid.node_type[i] != SOLID_MG) continue;
+        if (fields.C[i] <= cfg.C_thresh) continue;
 
-        int n_fluid_nbr = 0;
-        int n_total_nbr = 0;
-        bool salt_layer_blocked = false;
+        int k = global_to_local_[i];
+        if (k < 0) continue;
 
-        for (int jj = grid.nbr_offset[i]; jj < grid.nbr_offset[i + 1]; ++jj) {
-            int j = grid.nbr_index[jj];
-            if (grid.nbr_vol[jj] < 1e-30) continue;
-            n_total_nbr++;
-            if (grid.node_type[j] == FLUID) {
-                n_fluid_nbr++;
-                if (fields.C[j] >= cfg.C_sat) salt_layer_blocked = true;
-            }
+        // Compute dC_i/dt from the M matrix row: dC/dt = sum_j M[k,j]*C[j]
+        // This includes all bonds (solid-solid and interface)
+        double dCdt = 0.0;
+
+        // Sparse row iteration
+        for (Eigen::SparseMatrix<double>::InnerIterator it(M_, k); it; ++it) {
+            int col = it.col();
+            int g = local_to_global_[col];
+            dCdt += it.value() * fields.C[g];
         }
 
-        if (n_fluid_nbr == 0 || salt_layer_blocked) continue;
+        // Also add BC contribution
+        for (int p = bc_nbr_offset_[k]; p < bc_nbr_offset_[k + 1]; ++p) {
+            dCdt += bc_nbr_weight_[p] * fields.C[bc_nbr_global_[p]];
+        }
 
-        double f_exposure = static_cast<double>(n_fluid_nbr) /
-                            static_cast<double>(n_total_nbr);
-        double k_eff = cfg.k_corr;
-        if (fields.is_gb[i]) k_eff *= cfg.gb_corr_factor;
+        // dCdt should be negative for dissolving nodes (C flowing out to liquid)
+        // rate = |dC/dt| when dC/dt < 0
+        if (dCdt >= 0.0) continue;
 
-        double rate = k_eff * f_exposure;
+        double rate = -dCdt;
         if (rate < 1e-30) continue;
 
         double t_phase = (fields.C[i] - cfg.C_thresh) / rate;
@@ -467,16 +401,11 @@ double PD_ARD_ImplicitSolver::compute_adaptive_dt(const Fields& fields,
         }
     }
 
-    double dt;
-    if (min_t_phase < 2.0) {
-        // Close to dissolution: step directly to the event instead of
-        // fractioning (avoids Zeno's paradox of never reaching C_thresh)
-        dt = min_t_phase;
-    } else {
-        dt = cfg.implicit_dt_fraction * min_t_phase;
-    }
+    double dt = cfg.implicit_dt_fraction * min_t_phase;
     dt = std::min(dt, cfg.implicit_dt_max);
-    dt = std::max(dt, 1e-6);
+    // Floor: at least 1% of dt_max so the simulation makes progress.
+    // Backward Euler is unconditionally stable, so larger dt is safe.
+    dt = std::max(dt, cfg.implicit_dt_max * 0.01);
 
     return dt;
 }

@@ -26,7 +26,12 @@ struct Config {
     // Mg solid
     double rho_m = 1738.0;
 
-    // Transport
+    // Transport — bi-material PD diffusion model (Jafarzadeh, Chen & Bobaru 2018)
+    // D_liquid: diffusivity for liquid-liquid bonds (Mg²⁺ in water)
+    // D_grain:  micro-diffusivity for grain interior interface bonds
+    // D_gb:     micro-diffusivity for grain boundary interface bonds
+    // Interface bonds use harmonic mean: d = 2·d_S·d_L / (d_S + d_L)
+    // Solid-solid bonds are skipped (no diffusion within bulk solid)
     double D_liquid = 1.0e-9;
     double D_grain = 5.0e-11;
     double D_gb = 5.0e-9;
@@ -34,17 +39,12 @@ struct Config {
     double C_liquid_init = 0.0;
     double C_thresh = 0.2;
     double C_sat = 0.9;           // salt layer threshold: block dissolution when fluid C >= C_sat
-    double w_advect = 0.8;
     double alpha_art_diff = 0.1;  // artificial diffusion: D_art = alpha * |v| * dx
 
     // Grain structure
     double grain_size_mean = 40.0e-6;
     double grain_size_std = 5.0e-6;
     int gb_width_cells = 1;
-
-    // Corrosion kinetics
-    double k_corr = 1.0e-3;       // surface corrosion rate [1/s]
-    double gb_corr_factor = 3.0;   // grain boundary corrosion enhancement factor
 
     // Time stepping
     double cfl_factor = 0.25;       // CFL for flow solver

@@ -1,9 +1,10 @@
 # Build
 build/
+build_implicit/
 cmake-build-*/
 
 # Output data (VTI, CSV, PVD)
-output/
+output*/
 *.vti
 *.pvd
 
@@ -17,9 +18,8 @@ output/
 # macOS
 .DS_Store
 
-# Reference papers and legacy scripts
+# Reference papers
 references/
-legacy_scripts/
 
 # Claude Code
 .claude/

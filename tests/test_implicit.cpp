@@ -1,9 +1,7 @@
 // Standalone validation tests for the implicit ARD solver.
 //
-// Tests PD diffusion, PD advection, and combined PD advection-diffusion
-// by comparing the implicit Newton-Raphson+GMRES solver against:
-//   (a) the explicit Euler solver (both should agree at small dt)
-//   (b) analytical solutions where available
+// Tests PD diffusion, PD advection, combined PD advection-diffusion,
+// and solid-liquid interface dissolution (bi-material PD model).
 //
 // Build: cmake .. -DPD_DIM=2 && make test_implicit
 // Run:   ./test_implicit
@@ -47,13 +45,10 @@ static Config make_test_config(double D_liquid, double Q_flow) {
     cfg.C_liquid_init = 0.0;
     cfg.C_thresh = 0.2;
     cfg.C_sat = 10.0;          // high enough to not interfere with test Gaussians (C_max=1)
-    cfg.w_advect = 0.8;
     cfg.alpha_art_diff = 0.0;  // no artificial diffusion for clean tests
     cfg.grain_size_mean = 40.0e-6;
     cfg.grain_size_std = 5.0e-6;
     cfg.gb_width_cells = 0;
-    cfg.k_corr = 0.0;           // no dissolution
-    cfg.gb_corr_factor = 1.0;
     cfg.cfl_factor = 0.25;
     cfg.cfl_factor_corr = 0.25;
     cfg.use_implicit = 1;
@@ -235,9 +230,6 @@ static bool test_diffusion() {
     std::printf("  Explicit vs analytical L2 error: %.4e\n", err_exp);
 
     // Mass conservation
-    double mass_init = compute_total_mass(fields_exp, grid);
-    // Re-init for mass check since we already ran explicit above
-    // (mass_init is from the post-explicit state, compute from initial instead)
     Fields fields_mass_check;
     fields_mass_check.allocate(grid.N_total);
     init_fields_zero_vel(fields_mass_check, grid, cfg);
@@ -256,6 +248,10 @@ static bool test_diffusion() {
     int n_dt = 5;
     double prev_err = -1.0;
     double prev_dt = -1.0;
+
+    std::vector<double> errors_vs_analytical;
+    std::vector<double> convergence_rates;
+    double mass_change_finest = 0.0;
 
     for (int idt = 0; idt < n_dt; ++idt) {
         double dt_impl = dt_values[idt];
@@ -282,10 +278,14 @@ static bool test_diffusion() {
         double mass_impl = compute_total_mass(fields_impl, grid);
         double mass_change = std::abs(mass_impl - mass_init_true) / (mass_init_true + 1e-30) * 100.0;
 
+        errors_vs_analytical.push_back(err_impl);
+        if (idt == 0) mass_change_finest = mass_change;
+
         // Compute convergence rate (should be ~1 for backward Euler)
         double rate = -1.0;
         if (prev_err > 0.0 && err_impl > 1e-15) {
             rate = std::log(err_impl / prev_err) / std::log(dt_impl / prev_dt);
+            convergence_rates.push_back(rate);
         }
 
         std::printf("  dt=%.3f s (%2d steps): vs_analytical=%.4e, vs_explicit=%.4e, "
@@ -302,8 +302,28 @@ static bool test_diffusion() {
     }
 
     std::printf("  Expected convergence rate: ~1.0 (backward Euler is O(dt))\n");
-    std::printf("  PASS: diffusion test completed\n");
-    return true;
+
+    // --- Hard assertions ---
+    bool pass = true;
+    double finest_L2 = errors_vs_analytical.front();
+    if (finest_L2 > 0.05) {
+        std::printf("  FAIL: finest L2 error %.4e > 0.05 threshold\n", finest_L2);
+        pass = false;
+    }
+    if (mass_change_finest > 1.0) {
+        std::printf("  FAIL: mass conservation error %.4e%% > 1%% threshold\n", mass_change_finest);
+        pass = false;
+    }
+    bool has_good_rate = false;
+    for (double r : convergence_rates) if (r > 0.4) has_good_rate = true;
+    if (!has_good_rate) {
+        std::printf("  FAIL: no convergence rate > 0.4\n");
+        pass = false;
+    }
+
+    if (pass) std::printf("  PASS: diffusion test\n");
+    else      std::printf("  FAIL: diffusion test\n");
+    return pass;
 }
 
 // ============================================================================
@@ -392,6 +412,10 @@ static bool test_advection() {
     int n_dt = 4;
     double prev_err = -1.0, prev_dt = -1.0;
 
+    std::vector<double> errors_vs_analytical;
+    std::vector<double> convergence_rates;
+    double mass_change_finest = 0.0;
+
     for (int idt = 0; idt < n_dt; ++idt) {
         double dt_impl = dt_values[idt];
         Fields fields_impl;
@@ -417,9 +441,13 @@ static bool test_advection() {
         double mass_impl = compute_total_mass(fields_impl, grid);
         double mass_change = std::abs(mass_impl - mass_init) / (mass_init + 1e-30) * 100.0;
 
+        errors_vs_analytical.push_back(err_vs_exact);
+        if (idt == 0) mass_change_finest = mass_change;
+
         double rate = -1.0;
         if (prev_err > 0.0 && err_vs_exact > 1e-15) {
             rate = std::log(err_vs_exact / prev_err) / std::log(dt_impl / prev_dt);
+            convergence_rates.push_back(rate);
         }
 
         std::printf("  dt=%.1e s (%3d steps): vs_analytical=%.4e, vs_explicit=%.4e, "
@@ -434,8 +462,28 @@ static bool test_advection() {
     }
 
     std::printf("  Expected convergence rate: ~1.0 (backward Euler is O(dt))\n");
-    std::printf("  PASS: advection test completed\n");
-    return true;
+
+    // --- Hard assertions ---
+    bool pass = true;
+    double finest_L2 = errors_vs_analytical.front();
+    if (finest_L2 > 0.40) {
+        std::printf("  FAIL: finest L2 error %.4e > 0.40 threshold\n", finest_L2);
+        pass = false;
+    }
+    if (mass_change_finest > 1.0) {
+        std::printf("  FAIL: mass conservation error %.4e%% > 1%% threshold\n", mass_change_finest);
+        pass = false;
+    }
+    bool has_good_rate = false;
+    for (double r : convergence_rates) if (r > 0.3) has_good_rate = true;
+    if (!has_good_rate) {
+        std::printf("  FAIL: no convergence rate > 0.3\n");
+        pass = false;
+    }
+
+    if (pass) std::printf("  PASS: advection test\n");
+    else      std::printf("  FAIL: advection test\n");
+    return pass;
 }
 
 // ============================================================================
@@ -460,7 +508,7 @@ static bool test_advection_diffusion() {
 
     double sigma = 40.0e-6;
     double r0 = 0.0, z0 = -100.0e-6;
-    double t_end = 0.01;
+    double t_end = 0.002;  // displacement = 100 um, Gaussian stays well within domain
     double displacement = v_axial * t_end;
     std::printf("  t_end=%.3f s, displacement=%.1f um, diffusion length=%.1f um\n",
                 t_end, displacement * 1e6, std::sqrt(2.0 * D * t_end) * 1e6);
@@ -517,9 +565,13 @@ static bool test_advection_diffusion() {
 
     // --- Implicit solver at various dt ---
     std::printf("\n  [Implicit solver]\n");
-    double dt_values[] = {1e-4, 5e-4, 1e-3, 5e-3, 1e-2};
+    double dt_values[] = {1e-4, 2e-4, 5e-4, 1e-3, 2e-3};
     int n_dt = 5;
     double prev_err = -1.0, prev_dt = -1.0;
+
+    std::vector<double> errors_vs_analytical;
+    std::vector<double> convergence_rates;
+    double mass_change_finest = 0.0;
 
     for (int idt = 0; idt < n_dt; ++idt) {
         double dt_impl = dt_values[idt];
@@ -546,9 +598,13 @@ static bool test_advection_diffusion() {
         double mass_impl = compute_total_mass(fields_impl, grid);
         double mass_change = std::abs(mass_impl - mass_init) / (mass_init + 1e-30) * 100.0;
 
+        errors_vs_analytical.push_back(err_vs_exact);
+        if (idt == 0) mass_change_finest = mass_change;
+
         double rate = -1.0;
         if (prev_err > 0.0 && err_vs_exact > 1e-15) {
             rate = std::log(err_vs_exact / prev_err) / std::log(dt_impl / prev_dt);
+            convergence_rates.push_back(rate);
         }
 
         std::printf("  dt=%.1e s (%3d steps): vs_analytical=%.4e, vs_explicit=%.4e, "
@@ -571,7 +627,7 @@ static bool test_advection_diffusion() {
     writer.write(fname, grid, fields_exp, cfg);
     std::printf("\n  Wrote explicit result to %s\n", fname.c_str());
 
-    // Write implicit result at dt=1e-3
+    // Write implicit result at dt=5e-4
     {
         Fields fields_impl;
         fields_impl.allocate(grid.N_total);
@@ -582,7 +638,7 @@ static bool test_advection_diffusion() {
         impl.assemble(fields_impl, grid, cfg);
         t = 0.0;
         while (t < t_end - 1e-15) {
-            double dt = std::min(1e-3, t_end - t);
+            double dt = std::min(5e-4, t_end - t);
             impl.step(fields_impl, grid, cfg, dt);
             t += dt;
         }
@@ -592,8 +648,258 @@ static bool test_advection_diffusion() {
     }
 
     std::printf("  Expected convergence rate: ~1.0 (backward Euler is O(dt))\n");
-    std::printf("  PASS: advection-diffusion test completed\n");
-    return true;
+
+    // --- Hard assertions ---
+    bool pass = true;
+    double finest_L2 = errors_vs_analytical.front();
+    if (finest_L2 > 0.20) {
+        std::printf("  FAIL: finest L2 error %.4e > 0.20 threshold\n", finest_L2);
+        pass = false;
+    }
+    if (mass_change_finest > 1.0) {
+        std::printf("  FAIL: mass conservation error %.4e%% > 1%% threshold\n", mass_change_finest);
+        pass = false;
+    }
+    bool has_good_rate = false;
+    for (double r : convergence_rates) if (r > 0.3) has_good_rate = true;
+    if (!has_good_rate) {
+        std::printf("  FAIL: no convergence rate > 0.3\n");
+        pass = false;
+    }
+
+    if (pass) std::printf("  PASS: advection-diffusion test\n");
+    else      std::printf("  FAIL: advection-diffusion test\n");
+    return pass;
+}
+
+// ============================================================================
+// Test 4: Solid-Liquid Interface Dissolution (Bi-Material PD Model)
+// ============================================================================
+
+static bool test_interface_dissolution() {
+    std::printf("\n========================================\n");
+    std::printf("TEST 4: Solid-Liquid Interface Dissolution\n");
+    std::printf("========================================\n");
+
+    // Create a small domain with solid on one side, fluid on the other.
+    // The bi-material PD model should drive concentration from solid (C=1)
+    // to fluid (C=0) across the interface via harmonic-mean diffusivity bonds.
+    //
+    // Domain: 1D-like strip (narrow R_tube, long axial)
+    // Left half (z < 0): SOLID_MG with C = C_solid_init = 1.0
+    // Right half (z >= 0): FLUID with C = 0.0
+
+    Config cfg;
+    cfg.dx = 5.0e-6;
+    cfg.m_ratio = 3;
+    cfg.R_wire = 0.0;        // no pin geometry
+    cfg.L_wire = 0.0;
+    cfg.R_tube = 25.0e-6;    // narrow tube (5 nodes across radius)
+    cfg.L_upstream = 100.0e-6;
+    cfg.L_downstream = 100.0e-6;
+    cfg.rho_f = 1000.0;
+    cfg.mu_f = 1.0e-3;
+    cfg.c0 = 5.0;
+    cfg.eta_density = 0.1;
+    cfg.gamma_eos = 7.0;
+    cfg.Q_flow = 0.0;        // no flow
+    cfg.rho_m = 1738.0;
+    cfg.D_liquid = 1.0e-9;
+    cfg.D_grain = 5.0e-11;   // solid grain diffusivity
+    cfg.D_gb = 5.0e-9;       // GB diffusivity (not used here — no GB nodes)
+    cfg.C_solid_init = 1.0;
+    cfg.C_liquid_init = 0.0;
+    cfg.C_thresh = 0.2;
+    cfg.C_sat = 10.0;        // high enough to not trigger salt layer
+    cfg.alpha_art_diff = 0.0;
+    cfg.grain_size_mean = 40.0e-6;
+    cfg.grain_size_std = 5.0e-6;
+    cfg.gb_width_cells = 0;
+    cfg.cfl_factor = 0.25;
+    cfg.cfl_factor_corr = 0.25;
+    cfg.use_implicit = 1;
+    cfg.implicit_dt_max = 60.0;
+    cfg.implicit_dt_fraction = 0.5;
+    cfg.newton_tol = 1.0e-10;
+    cfg.newton_max_iter = 30;
+    cfg.compute_derived();
+
+    std::printf("  dx=%.1e, delta=%.1e, D_liquid=%.1e, D_grain=%.1e\n",
+                cfg.dx, cfg.delta, cfg.D_liquid, cfg.D_grain);
+    std::printf("  Harmonic mean D_interface = %.2e\n",
+                2.0 * cfg.D_liquid * cfg.D_grain / (cfg.D_liquid + cfg.D_grain));
+
+    Grid grid;
+    grid.build(cfg);
+    grid.build_neighbors();
+    std::printf("  Grid: %d total nodes\n", grid.N_total);
+
+    // Manually set the left half as SOLID_MG
+    // z < 0 => SOLID, z >= 0 => FLUID (keep existing BCs for INLET/OUTLET/WALL)
+    Fields fields;
+    fields.allocate(grid.N_total);
+
+    int n_solid = 0, n_fluid = 0;
+    for (int i = 0; i < grid.N_total; ++i) {
+        fields.rho[i] = cfg.rho_f;
+        fields.vel[i] = vec_zero();
+        fields.phase[i] = 1;
+        fields.grain_id[i] = -1;
+        fields.is_gb[i] = 0;
+
+        if (grid.node_type[i] == FLUID) {
+            double z = grid.pos[i][1];  // axial coordinate
+            if (z < 0.0) {
+                // Convert to solid
+                grid.node_type[i] = SOLID_MG;
+                fields.phase[i] = 0;
+                fields.C[i] = cfg.C_solid_init;
+                fields.D_map[i] = cfg.D_grain;
+                fields.rho[i] = cfg.rho_m;
+                n_solid++;
+            } else {
+                fields.C[i] = cfg.C_liquid_init;
+                fields.D_map[i] = cfg.D_liquid;
+                n_fluid++;
+            }
+        } else if (grid.node_type[i] == INLET || grid.node_type[i] == OUTLET) {
+            fields.C[i] = 0.0;
+            fields.D_map[i] = cfg.D_liquid;
+        } else {
+            fields.C[i] = 0.0;
+            fields.D_map[i] = 0.0;
+        }
+    }
+    fields.rho_new = fields.rho;
+    fields.vel_new = fields.vel;
+    fields.C_new = fields.C;
+
+    std::printf("  Solid nodes: %d, Fluid nodes: %d\n", n_solid, n_fluid);
+
+    // Record initial solid C for comparison
+    double C_solid_init_sum = 0.0;
+    for (int i = 0; i < grid.N_total; ++i) {
+        if (grid.node_type[i] == SOLID_MG) C_solid_init_sum += fields.C[i];
+    }
+
+    // --- Run implicit solver ---
+    PD_ARD_ImplicitSolver impl;
+    impl.init(grid, cfg);
+    impl.assemble(fields, grid, cfg);
+
+    double t = 0.0;
+    double t_end = 100.0;   // enough time for significant diffusion
+    int n_steps = 0;
+    double dt_impl = 1.0;   // 1 second steps
+
+    std::printf("\n  Running implicit solver for %.0f s with dt=%.1f s\n", t_end, dt_impl);
+
+    while (t < t_end - 1e-12) {
+        double dt = std::min(dt_impl, t_end - t);
+        impl.step(fields, grid, cfg, dt);
+        t += dt;
+        n_steps++;
+    }
+
+    // Check results
+    double C_solid_sum = 0.0;
+    double C_solid_min = 1e30, C_solid_max = -1e30;
+    double C_fluid_sum = 0.0;
+    double C_fluid_max = 0.0;
+    int n_solid_now = 0;
+
+    for (int i = 0; i < grid.N_total; ++i) {
+        if (grid.node_type[i] == SOLID_MG) {
+            C_solid_sum += fields.C[i];
+            if (fields.C[i] < C_solid_min) C_solid_min = fields.C[i];
+            if (fields.C[i] > C_solid_max) C_solid_max = fields.C[i];
+            n_solid_now++;
+        } else if (grid.node_type[i] == FLUID) {
+            C_fluid_sum += fields.C[i];
+            if (fields.C[i] > C_fluid_max) C_fluid_max = fields.C[i];
+        }
+    }
+
+    std::printf("\n  Results after %d steps (t=%.1f s):\n", n_steps, t);
+    std::printf("  Solid C: min=%.4f, max=%.4f, avg=%.4f (was 1.0000)\n",
+                C_solid_min, C_solid_max, C_solid_sum / (n_solid_now + 1e-30));
+    std::printf("  Fluid C: max=%.4f, sum=%.4f\n", C_fluid_max, C_fluid_sum);
+    std::printf("  Total C: solid+fluid=%.4f (initial solid sum=%.4f)\n",
+                C_solid_sum + C_fluid_sum, C_solid_init_sum);
+
+    // Verify key properties:
+    bool pass = true;
+
+    // 1. Solid concentration at surface should have decreased
+    if (C_solid_min >= cfg.C_solid_init - 1e-10) {
+        std::printf("  FAIL: Solid surface C did not decrease (min=%.6f)\n", C_solid_min);
+        pass = false;
+    } else {
+        std::printf("  OK: Solid surface C decreased from 1.0 to %.4f\n", C_solid_min);
+    }
+
+    // 2. Fluid concentration near interface should have increased
+    if (C_fluid_max <= 1e-10) {
+        std::printf("  FAIL: Fluid C did not increase (max=%.6f)\n", C_fluid_max);
+        pass = false;
+    } else {
+        std::printf("  OK: Fluid C increased to max=%.4f near interface\n", C_fluid_max);
+    }
+
+    // 3. Mass balance: total C should not increase (boundary nodes at C=0 absorb mass)
+    //    In a small domain with fast D_liquid, C leaks to INLET/OUTLET BCs — expected.
+    double total_C = C_solid_sum + C_fluid_sum;
+    if (total_C > C_solid_init_sum * 1.01) {
+        std::printf("  FAIL: Total C increased (%.4f > %.4f) — possible bug\n",
+                    total_C, C_solid_init_sum);
+        pass = false;
+    } else {
+        double lost_frac = (C_solid_init_sum - total_C) / C_solid_init_sum * 100.0;
+        std::printf("  OK: Total C decreased by %.1f%% (mass absorbed by boundary BCs)\n",
+                    lost_frac);
+    }
+
+    // 4. Test phase change: run much longer and check if surface nodes dissolve
+    std::printf("\n  Testing phase change...\n");
+    double t_phase_end = 10000.0;   // long enough for surface to dissolve
+    dt_impl = 10.0;
+    while (t < t_phase_end - 1e-12) {
+        double dt = std::min(dt_impl, t_phase_end - t);
+        impl.step(fields, grid, cfg, dt);
+        t += dt;
+        n_steps++;
+    }
+
+    int n_dissolved = impl.apply_phase_change(fields, grid, cfg);
+    std::printf("  After t=%.0f s: %d nodes dissolved\n", t, n_dissolved);
+
+    if (n_dissolved > 0) {
+        std::printf("  OK: Phase change triggered (%d nodes dissolved)\n", n_dissolved);
+    } else {
+        // Check if any solid node is close to threshold
+        double C_min_solid = 1.0;
+        for (int i = 0; i < grid.N_total; ++i) {
+            if (grid.node_type[i] == SOLID_MG && fields.C[i] < C_min_solid) {
+                C_min_solid = fields.C[i];
+            }
+        }
+        std::printf("  INFO: No dissolution yet (min solid C=%.4f, thresh=%.2f)\n",
+                    C_min_solid, cfg.C_thresh);
+        // This is ok — with D_grain=5e-11, dissolution takes a long time
+        // The test verifies the mechanism works (C decreases toward threshold)
+        if (C_min_solid < 0.9) {
+            std::printf("  OK: Solid C is decreasing toward threshold\n");
+        } else {
+            std::printf("  WARN: Solid C barely changed — check D_grain value\n");
+        }
+    }
+
+    if (pass) {
+        std::printf("  PASS: interface dissolution test completed\n");
+    } else {
+        std::printf("  FAIL: interface dissolution test\n");
+    }
+    return pass;
 }
 
 // ============================================================================
@@ -611,6 +917,7 @@ int main() {
     ok &= test_diffusion();
     ok &= test_advection();
     ok &= test_advection_diffusion();
+    ok &= test_interface_dissolution();
 
     std::printf("\n========================================\n");
     if (ok) {

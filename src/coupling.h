@@ -18,6 +18,7 @@ private:
     VTKWriter writer_;
 
     int initial_solid_count_ = 0;
+    int total_dissolved_ = 0;
     int frame_count_ = 0;
 
     std::string make_filename(const Config& cfg, const std::string& prefix,

@@ -139,9 +139,12 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
 
             int implicit_step = 0;
             double t_cycle_start = t_corr;
-            bool phase_change_imminent = false;
+            bool dissolution_occurred = false;
 
-            while (!phase_change_imminent && t_corr < cfg.T_final) {
+            // Run corrosion_steps_per_check implicit steps per cycle,
+            // or until a node actually dissolves (C < C_thresh).
+            while (implicit_step < cfg.corrosion_steps_per_check &&
+                   t_corr < cfg.T_final && !dissolution_occurred) {
                 double dt_impl = ard_implicit_solver_.compute_adaptive_dt(fields, grid, cfg);
 
                 // Apply concentration BCs
@@ -149,7 +152,7 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
                 apply_outlet_bc(fields, grid, cfg);
                 apply_wall_concentration_bc(fields, grid);
 
-                int n_newton = ard_implicit_solver_.step(fields, grid, cfg, dt_impl);
+                ard_implicit_solver_.step(fields, grid, cfg, dt_impl);
 
                 smooth_boundary_concentration(fields, grid, cfg);
 
@@ -164,24 +167,17 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
                     write_diagnostics(grid, fields, t_corr, cfg);
                 }
 
-                // Check if any solid node is close to phase change
-                double dt_next = ard_implicit_solver_.compute_adaptive_dt(fields, grid, cfg);
-                if (dt_next <= 0.1) {
-                    // Take one final step to push past the dissolution threshold
-                    // instead of fractioning forever (Zeno's paradox fix)
-                    apply_inlet_bc(fields, grid, cfg);
-                    apply_outlet_bc(fields, grid, cfg);
-                    apply_wall_concentration_bc(fields, grid);
-                    ard_implicit_solver_.step(fields, grid, cfg, dt_next);
-                    smooth_boundary_concentration(fields, grid, cfg);
-                    t_corr += dt_next;
-                    implicit_step++;
-                    phase_change_imminent = true;
+                // Check if any solid node has actually reached dissolution threshold
+                for (int i = 0; i < grid.N_total; ++i) {
+                    if (grid.node_type[i] == SOLID_MG && fields.C[i] < cfg.C_thresh) {
+                        dissolution_occurred = true;
+                        break;
+                    }
                 }
             }
 
-            std::printf("  Implicit cycle: %d steps, dt range covers t=%.2f to %.2f s\n",
-                        implicit_step, t_cycle_start, t_corr);
+            std::printf("  Implicit cycle: %d steps, t=%.2f to %.2f s (%.4f h)\n",
+                        implicit_step, t_cycle_start, t_corr, t_corr / 3600.0);
         } else {
             // --- EXPLICIT PATH (fallback) ---
             double dt_corr = ard_solver_.compute_dt(fields, grid, cfg);
@@ -215,9 +211,13 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
         int n_dissolved = cfg.use_implicit
             ? ard_implicit_solver_.apply_phase_change(fields, grid, cfg)
             : ard_solver_.apply_phase_change(fields, grid, cfg);
-        need_flow_solve = (n_dissolved > 0);
+        total_dissolved_ += n_dissolved;
+        // Only re-solve flow when enough nodes have dissolved to affect the velocity field
+        // (avoids expensive flow re-solve for every single dissolved node)
+        need_flow_solve = (n_dissolved >= 10);
         if (n_dissolved > 0) {
-            std::printf("  Phase change: %d nodes dissolved\n", n_dissolved);
+            std::printf("  Phase change: %d nodes dissolved (total: %d)\n",
+                        n_dissolved, total_dissolved_);
             update_node_types_after_dissolution(grid, fields);
 
             if (n_dissolved > 10) {

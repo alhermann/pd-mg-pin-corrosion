@@ -130,7 +130,7 @@ int main(int argc, char* argv[]) {
     if (argc > 1) {
         cfg.load(argv[1]);
     } else {
-        cfg.load("params.cfg");
+        cfg.load("config/params.cfg");
     }
     cfg.print();
 

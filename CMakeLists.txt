@@ -55,13 +55,14 @@ target_link_libraries(pd_corrosion PRIVATE OpenMP::OpenMP_CXX Eigen3::Eigen)
 
 # Test executable for implicit ARD solver validation
 add_executable(test_implicit
-    src/test_implicit.cpp
+    tests/test_implicit.cpp
     src/config.cpp
     src/grid.cpp
     src/pd_ard.cpp
     src/pd_ard_implicit.cpp
     src/vtk_writer.cpp
 )
+target_include_directories(test_implicit PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(test_implicit PRIVATE PD_DIM=${PD_DIM})
 target_link_libraries(test_implicit PRIVATE OpenMP::OpenMP_CXX Eigen3::Eigen)
 
