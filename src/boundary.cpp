@@ -75,26 +75,29 @@ void apply_inlet_bc(Fields& f, const Grid& g, const Config& cfg) {
 }
 
 // ---------------------------------------------------------------------------
-// Outlet BC: zero-gradient extrapolation (all quantities)
+// Outlet BC: pressure outlet (p=0) with zero-gradient velocity/concentration
 //
-// In weakly compressible methods, the pressure field is fully determined by
-// the density evolution via the EOS. The outlet does NOT need to enforce
-// p=0 — it just needs to let the flow exit smoothly.
+// Following Song, Chen & Bobaru (2025): the pressure of outlet fictitious
+// nodes is set to zero, which means rho = rho_f via the Tait EOS. This
+// anchors the pressure field and prevents outlet pressure artifacts.
 //
-// All quantities (velocity, density, concentration) are extrapolated from
-// interior fluid neighbors using zero-gradient (Neumann) BCs.
+// Velocity and concentration are extrapolated from interior fluid neighbors
+// using zero-gradient (Neumann) BCs. The transverse velocity component is
+// set to zero to suppress spurious cross-flow at the outlet.
 // ---------------------------------------------------------------------------
 void apply_outlet_bc(Fields& f, const Grid& g, const Config& cfg) {
     int N = g.N_total;
+    int ax = (DIM == 2) ? 1 : 2; // axial direction index
 
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < N; ++i) {
         if (g.node_type[i] != OUTLET) continue;
 
-        // Average all quantities from fluid and other outlet neighbours
-        // (cascading extrapolation: inner outlets already have fluid values)
+        // Enforce p=0 via rho = rho_f (Tait EOS gives p=0 when rho=rho_0)
+        f.rho[i] = cfg.rho_f;
+
+        // Extrapolate velocity and concentration from fluid neighbors
         Vec v_avg = vec_zero();
-        double rho_avg = 0.0;
         double C_avg = 0.0;
         int count = 0;
 
@@ -102,7 +105,6 @@ void apply_outlet_bc(Fields& f, const Grid& g, const Config& cfg) {
             int j = g.nbr_index[jj];
             if (g.node_type[j] == FLUID || g.node_type[j] == OUTLET) {
                 for (int d = 0; d < DIM; ++d) v_avg[d] += f.vel[j][d];
-                rho_avg += f.rho[j];
                 C_avg += f.C[j];
                 count++;
             }
@@ -111,18 +113,17 @@ void apply_outlet_bc(Fields& f, const Grid& g, const Config& cfg) {
         if (count > 0) {
             double inv_c = 1.0 / count;
             for (int d = 0; d < DIM; ++d) v_avg[d] *= inv_c;
-            rho_avg *= inv_c;
             C_avg *= inv_c;
 
-            f.vel[i] = v_avg;
-            f.rho[i] = rho_avg;
+            // Keep axial velocity from extrapolation, zero transverse
+            Vec v_out = vec_zero();
+            v_out[ax] = v_avg[ax];
+            f.vel[i] = v_out;
             f.C[i]   = C_avg;
         } else {
             Vec v_in = vec_zero();
-            if constexpr (DIM == 2) { v_in[1] = cfg.U_in; }
-            else                    { v_in[2] = cfg.U_in; }
+            v_in[ax] = cfg.U_in;
             f.vel[i] = v_in;
-            f.rho[i] = cfg.rho_f;
             f.C[i]   = cfg.C_liquid_init;
         }
     }

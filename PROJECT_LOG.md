@@ -227,11 +227,11 @@ exactly on a grid node for a uniform grid when R_tube is grid-aligned.
   3D: v(r) = 2*U_in*(1 - (r/R_tube)^2)
 - rho = rho_f, p = 0, C = C_liquid_init = 0
 
-**Outlet (downstream ghost layer):**
-- Zero pressure: rho = rho_f (from EOS with p=0)
-- Velocity: averaged over ALL fluid neighbors (smoother zero-gradient
-  extrapolation than single-neighbor approach)
-- Concentration: averaged over all fluid neighbors (zero-gradient)
+**Outlet (downstream ghost layer) — pressure outlet per Song et al. (2025):**
+- Density: `rho = rho_f` (enforces p=0 via Tait EOS, anchors pressure field)
+- Velocity: axial component extrapolated from fluid neighbors (zero-gradient);
+  transverse component set to zero
+- Concentration: extrapolated from fluid neighbors (zero-gradient)
 - Fallback to uniform inlet velocity if no fluid neighbors found
 
 **Solid Mg surface:**
@@ -502,6 +502,31 @@ the corrosion loop and after phase change, creating duplicate entries.
 mode at the start of each run. (b) Removed the duplicate call; diagnostics
 are written only inside the corrosion output loop.
 
+### 5.18 Outlet BC — Pressure Outlet (p=0) per Song et al. (2025)
+
+**Problem:** The zero-gradient density extrapolation at the outlet let the pressure
+field float, causing a pressure bump near the outlet boundary. The pressure
+gradient for Poiseuille flow had 12.7% error, and the flow solver needed 26.5k
+iterations to converge.
+
+**Root cause:** In weakly compressible methods, the pressure is determined by
+density via the EOS. Without anchoring the density at the outlet, pressure
+waves reflect off the boundary and create artifacts. Song et al. (2025)
+Section 3.2 explicitly state: "the pressure of the virtual nodes at the outlet
+is uniformly set to 0."
+
+**Solution:** Changed the outlet BC to:
+- **Density:** `rho = rho_f` (enforces p=0 via Tait EOS)
+- **Velocity:** Axial component extrapolated from fluid neighbors (zero-gradient);
+  transverse component set to zero (suppresses spurious cross-flow)
+- **Concentration:** Extrapolated from fluid neighbors (zero-gradient)
+
+**Results (Poiseuille flow without pin, L_upstream=1500 um):**
+- Pressure gradient error: 12.7% → **2.1%**
+- Flow convergence: 26.5k → **9.3k iterations** (~3x faster)
+- Velocity L2 error at midpoint: 1.7% → 1.9% (slight increase near outlet,
+  but interior and pressure field are much better)
+
 ---
 
 ## 6. What Still Needs To Be Done
@@ -514,10 +539,12 @@ are written only inside the corrosion output loop.
 - [ ] **Grain resolution**: With dx=5 um and grain_size=40 um, grains are only
       8 cells across → 46% of nodes are GB (with gb_width_cells=0, no dilation).
       For thinner boundaries: dx=2 um or grain_size=80 um.
-- [ ] **Poiseuille validation error**: L2 error ~16.5% at the upstream cross-
-      section (improved from ~48% by increasing L_upstream from 80 to 500 um).
-      Full Poiseuille development needs ~1.3mm upstream at Re=19.
-      For better validation, increase L_upstream or validate without pin.
+- [x] **Poiseuille validation error**: Resolved. The 16.5% error was caused by
+      the pin's upstream hydrodynamic influence, not a solver defect. Without
+      pin (R_wire=0), L2 velocity error is 0.8–1.9% in the interior.
+      Pressure gradient error reduced from 12.7% to 2.1% by fixing the
+      outlet BC (see 5.18 below). Remaining error is from PD horizon
+      truncation near walls (δ/R_tube = 10%).
 - [ ] **Concentration saturation at pin surface**: C_max_fluid = 1.0 (the
       clamp limit) near the pin. The dissolution source term
       (~5.7e-4 /s) overwhelms PD diffusion (~1.1e-7 /s), saturating the
@@ -538,14 +565,17 @@ are written only inside the corrosion output loop.
 - [x] **Wall BC smoothness**: Proper geometric reflection mirroring replaces
       nearest-neighbor approach. Symmetric density, antisymmetric velocity.
 - [x] **Outlet BC smoothness**: Averaging over all fluid neighbors instead
-      of single nearest neighbor.
+      of single nearest neighbor. Then upgraded to pressure outlet (p=0)
+      per Song et al. (2025) — see 5.18.
 - [x] **Poiseuille initialization**: Fluid nodes initialized with analytical
       Poiseuille profile for ~10x faster initial flow convergence.
 - [ ] **3D validation**: Build with `-DPD_DIM=3` and verify.
-- [ ] **Poiseuille validation** without pin (R_wire=0).
+- [x] **Poiseuille validation** without pin (R_wire=0). Velocity L2 < 2%,
+      pressure gradient error 2.1%. See `params_poiseuille.cfg` and
+      `plot_poiseuille.py` for the validation setup.
 - [ ] **Flow around cylinder validation**.
 - [ ] **Pure diffusion test**.
-- [ ] **GitHub repository**: Set up via `gh` CLI.
+- [x] **GitHub repository**: Set up at github.com/alhermann/pd-mg-pin-corrosion.
 
 ### 6.3 Low Priority / Future Enhancements
 
