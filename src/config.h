@@ -33,6 +33,7 @@ struct Config {
     double C_solid_init = 1.0;
     double C_liquid_init = 0.0;
     double C_thresh = 0.2;
+    double C_sat = 0.9;           // salt layer threshold: block dissolution when fluid C >= C_sat
     double w_advect = 0.8;
     double alpha_art_diff = 0.1;  // artificial diffusion: D_art = alpha * |v| * dx
 

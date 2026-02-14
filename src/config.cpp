@@ -58,6 +58,7 @@ void Config::load(const std::string& filename) {
         else if (key == "C_solid_init")      C_solid_init = std::stod(val);
         else if (key == "C_liquid_init")     C_liquid_init = std::stod(val);
         else if (key == "C_thresh")          C_thresh = std::stod(val);
+        else if (key == "C_sat")             C_sat = std::stod(val);
         else if (key == "w_advect")          w_advect = std::stod(val);
         else if (key == "alpha_art_diff")    alpha_art_diff = std::stod(val);
         else if (key == "grain_size_mean")   grain_size_mean = std::stod(val);
@@ -112,6 +113,7 @@ void Config::print() const {
     std::printf("  D_liquid     = %.2e m2/s\n", D_liquid);
     std::printf("  D_grain      = %.2e m2/s\n", D_grain);
     std::printf("  D_gb         = %.2e m2/s\n", D_gb);
+    std::printf("  C_sat        = %.2f\n", C_sat);
     std::printf("  k_corr       = %.2e 1/s\n", k_corr);
     std::printf("  gb_corr_fac  = %.1f\n", gb_corr_factor);
     std::printf("  T_final      = %.1f s (%.2f h)\n", T_final, T_final / 3600.0);

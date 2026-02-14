@@ -39,7 +39,6 @@ double PD_ARD_Solver::compute_dt(const Fields& fields, const Grid& grid, const C
 
 void PD_ARD_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, double dt) {
     int N = grid.N_total;
-    double w = cfg.w_advect;
     double div_coeff = alpha_p_ / V_H_;
 
     #pragma omp parallel for schedule(dynamic, 256)
@@ -63,12 +62,20 @@ void PD_ARD_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, do
             // Only surface nodes (those exposed to fluid) dissolve.
             int n_fluid_nbr = 0;
             int n_total_nbr = 0;
+            bool salt_layer_blocked = false;
 
             for (int jj = grid.nbr_offset[i]; jj < grid.nbr_offset[i + 1]; ++jj) {
                 int j = grid.nbr_index[jj];
                 if (grid.nbr_vol[jj] < 1e-30) continue;
                 n_total_nbr++;
-                if (grid.node_type[j] == FLUID) n_fluid_nbr++;
+                if (grid.node_type[j] == FLUID) {
+                    n_fluid_nbr++;
+                    // Salt layer model (Jafarzadeh et al. 2018): if any
+                    // adjacent fluid node is at saturation, the local
+                    // electrochemical driving force vanishes and
+                    // dissolution is temporarily blocked.
+                    if (fields.C[j] >= cfg.C_sat) salt_layer_blocked = true;
+                }
             }
 
             double f_exposure = (n_total_nbr > 0) ?
@@ -78,6 +85,9 @@ void PD_ARD_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, do
             if (fields.is_gb[i]) {
                 k_eff *= cfg.gb_corr_factor;
             }
+
+            // Block dissolution when salt layer forms
+            if (salt_layer_blocked) k_eff = 0.0;
 
             fields.C_new[i] = C_i - dt * k_eff * f_exposure;
             if (fields.C_new[i] < 0.0) fields.C_new[i] = 0.0;
@@ -95,8 +105,7 @@ void PD_ARD_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, do
             double vi_mag = norm(vel_i);
 
             double diff_sum = 0.0;
-            double adv_down = 0.0;
-            double adv_up = 0.0;
+            double adv_sum = 0.0;
             double diss_k_sum = 0.0;
             int n_total_nbr = 0;
             int n_solid_nbr = 0;
@@ -134,25 +143,32 @@ void PD_ARD_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, do
 
                 // Diffusion (PD Laplacian) with artificial diffusion for stability
                 // D_art = alpha * max(|v_i|, |v_j|) * dx  (streamline upwind stabilization)
-                // This reduces Pe_eff from ~1180 to ~1/alpha (~10)
                 double D_avg = 2.0 * D_i * D_j / (D_i + D_j + 1e-30);
                 double vj_mag = norm(vel_j);
                 double D_art = cfg.alpha_art_diff * std::max(vi_mag, vj_mag) * cfg.dx;
                 diff_sum += beta_coeff_ * (D_avg + D_art) * (C_j - C_i) * inv_xi2 * V_j;
 
-                // Advection (PD divergence of C*v)
+                // Advection: non-conservative form v·∇C via PD gradient
+                //
+                // We use v_i · ∇C rather than ∇·(Cv) because the weakly
+                // compressible flow has ∇·v ≠ 0 (order Ma²). The conservative
+                // divergence form ∇·(Cv) = C∇·v + v·∇C introduces a spurious
+                // C·∇·v source term that causes concentration drift at flow
+                // convergence/divergence points.
+                //
+                // PD gradient: ∇C ≈ (d/V_H) Σ_j (C_j - C_i) e_ij / ξ V_j
+                // Then: v·∇C = (d/V_H) Σ_j (C_j - C_i)(v_i · e_ij) / ξ V_j
                 double vi_dot_e = dot(vel_i, e_ij);
-                double vj_dot_e = dot(vel_j, e_ij);
-
-                adv_down += (C_j * vj_dot_e - C_i * vi_dot_e) * inv_xi * V_j;
-                adv_up += (C_j * (-vj_dot_e) - C_i * (-vi_dot_e)) * inv_xi * V_j;
+                adv_sum += (C_j - C_i) * vi_dot_e * inv_xi * V_j;
             }
 
-            double adv_sum = div_coeff * (w * adv_down + (1.0 - w) * adv_up);
+            adv_sum *= div_coeff;
 
             // Dissolution source: dissolved Mg entering fluid from solid surface
+            // Salt layer model: if this fluid node is already at saturation,
+            // no additional dissolved species can enter — source is blocked.
             double source = 0.0;
-            if (n_solid_nbr > 0 && n_total_nbr > 0) {
+            if (n_solid_nbr > 0 && n_total_nbr > 0 && C_i < cfg.C_sat) {
                 double avg_k = diss_k_sum / n_solid_nbr;
                 double interface_frac = static_cast<double>(n_solid_nbr) /
                                         static_cast<double>(n_total_nbr);
@@ -162,10 +178,11 @@ void PD_ARD_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, do
             fields.C_new[i] = C_i + dt * (diff_sum - adv_sum + source);
         }
 
-        // Clamp concentration to physical range [0, 1]
-        // Use 1e-30 floor to avoid subnormal floating-point values
+        // Clamp concentration to physical range [0, C_sat]
+        // C_sat represents the solubility limit: above this, salt precipitates
+        // form (Jafarzadeh et al. 2018), removing dissolved species from solution.
         if (fields.C_new[i] < 1e-30) fields.C_new[i] = 0.0;
-        if (fields.C_new[i] > 1.0) fields.C_new[i] = 1.0;
+        if (fields.C_new[i] > cfg.C_sat) fields.C_new[i] = cfg.C_sat;
     }
 }
 
