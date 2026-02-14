@@ -142,8 +142,10 @@ void PD_ARD_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, do
             // PD diffusion
             diff_sum += beta_coeff_ * (D_avg + D_art) * (C_j - C_i) * inv_xi2 * V_j;
 
-            // Advection: non-conservative form v_i . e_ij (only for fluid nodes)
-            if (i_is_fluid) {
+            // Advection: non-conservative form v_i . e_ij (fluid-fluid bonds only).
+            // Interface bonds (fluid-solid) carry ONLY diffusion —
+            // advection does not apply across the solid-liquid interface.
+            if (i_is_fluid && j_is_fluid) {
                 double vi_dot_e = dot(vel_i, e_ij);
                 adv_sum += (C_j - C_i) * vi_dot_e * inv_xi * V_j;
             }

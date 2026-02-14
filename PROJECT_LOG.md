@@ -190,14 +190,20 @@ where:
 - `beta_coeff = 4 / (pi * delta^2)` [2D] or `12 / (pi * delta^2)` [3D]
 - No extra `1/V_H` factor — beta_coeff IS the complete PD Laplacian coefficient
 
-**PD advection (non-conservative form):**
+**PD advection (non-conservative form, fluid-fluid bonds ONLY):**
 ```
-  dC/dt|_adv = (d/V_H) * SUM_j [ (C_j - C_i) * (v_i . e_ij) / |xi| ] V_j
+  dC/dt|_adv = (d/V_H) * SUM_{j in fluid} [ (C_j - C_i) * (v_i . e_ij) / |xi| ] V_j
 ```
-This is `v·nabla C` computed via PD gradient. Uses only the local velocity `v_i`
-(not neighbor velocities), giving `v·nabla C ~ 0` at stagnation points. The
-non-conservative form avoids the spurious `C·div(v)` source from weakly
-compressible flow (see Section 5.19).
+This is `v·nabla C` computed via PD gradient (Song, Chen & Bobaru 2025). Uses
+only the local velocity `v_i` (not neighbor velocities), giving `v·nabla C ~ 0`
+at stagnation points. The non-conservative form avoids the spurious `C·div(v)`
+source from weakly compressible flow (see Section 5.19).
+
+**IMPORTANT:** Advection is applied ONLY to fluid-fluid bonds. Interface bonds
+(fluid-solid) carry ONLY diffusion. Advection is a fluid-phase transport
+mechanism and does not apply across the solid-liquid interface. Including
+advection on interface bonds causes unphysical concentration injection
+(w_adv/w_diff ~ 40,000x at stagnation points). See Section 5.20.
 
 **Artificial diffusion** (liquid-liquid bonds only):
 ```
@@ -644,18 +650,58 @@ continues (pin_mass_loss = 0.008% at t=0.5s). The salt layer self-regulates:
 dissolution pauses at saturated interface nodes, resumes when transport carries
 concentration away.
 
+### 5.20 Advection on Interface Bonds — Unphysical Concentration Injection
+
+**Problem:** C_max_fluid = 1.0 at the very first diagnostic output (t=30s, no
+dissolution yet). The fluid concentration near the pin reached solid-like values
+despite D_interface ~ 2e-16 m^2/s predicting only ~1e-4 concentration change.
+
+**Root cause:** The PD advection operator `v . nabla C` was applied to ALL
+bonds of fluid nodes, including solid-liquid interface bonds. At stagnation
+points where v_i points toward the solid (v_i . e_ij ~ 0.5 m/s), the advection
+weight w_adv ~ 2400 /s completely dominated the diffusion weight w_diff ~ 0.06 /s
+(ratio ~40,000:1). This effectively injected the solid concentration (C=1.0) into
+the fluid via the advection operator.
+
+In the implicit solver, this was catastrophic: with dt=0.6 s, the system
+`(I - dt*M)*C = C_old` produced C_fluid ~ 1.0 at interface nodes because the
+advection term dominated the system matrix.
+
+**Physics:** Advection is a fluid-phase transport mechanism: `v . nabla C`
+represents transport of dissolved species by bulk fluid motion. It should only
+apply to fluid-fluid bonds. At the solid-liquid interface, transport is purely
+diffusive (Jafarzadeh, Chen & Bobaru 2018). The solid has no velocity, and the
+PD advection gradient should not sample the solid concentration field.
+
+**Fix:** Restrict advection to fluid-fluid bonds only in both solvers:
+```cpp
+// Before (buggy):
+if (i_is_fluid) { w_adv = ...; }
+// After (correct):
+if (i_is_fluid && j_is_fluid) { w_adv = ...; }
+```
+
+**Also fixed:** Flow re-solve after dissolution. The previous threshold
+(`n_dissolved >= 10` per cycle) was never reached because nodes dissolve 1-2
+at a time. Changed to always re-solve flow when any dissolution occurs. Newly
+dissolved fluid nodes now get proper velocity/pressure from PD-NS. Subsequent
+flow solves converge in 900-1500 iterations (warm start) vs 22k for the initial.
+
+**Results after fix:** C_max_fluid = 5e-7 (correct, dissolved Mg washed away
+by flow). 4 nodes dissolved in 1 hour (vs 122 with the bug). Parameters need
+recalibration with the corrected physics.
+
 ---
 
 ## 6. What Still Needs To Be Done
 
 ### 6.1 High Priority
 
-- [x] **Parameter calibration**: Calibrated via bi-material PD diffusion model.
-      D_grain = 1e-16, D_gb = 1e-14, gb_width_cells = 0. Interface diffusivity
-      controlled by harmonic mean (dominated by small D_solid). 1-hour diagnostic:
-      12.8% mass loss → extrapolates to ~50% at 9h. See Section 10.6.
-- [ ] **Full 9h simulation**: Run with calibrated parameters and verify final
-      mass loss matches Reimers et al. (2023) ~50% at 9h.
+- [ ] **Parameter recalibration**: After fixing advection on interface bonds
+      (Section 5.20), dissolution rate is ~3%/h (was 12.8%/h with the bug).
+      D_grain needs to increase ~2-4x. Current: D_grain=1e-16, D_gb=1e-14.
+      Target: ~50% mass loss at 9h (Reimers et al. 2023).
+- [ ] **Full 9h simulation**: Run with recalibrated parameters and verify.
 - [ ] **Grain resolution**: With dx=5 um and grain_size=40 um, grains are only
       8 cells across → 46% of nodes are GB (with gb_width_cells=0, no dilation).
       For thinner boundaries: dx=2 um or grain_size=80 um.
@@ -971,13 +1017,11 @@ by the smaller value (D_solid).
 | 3 | 5e-15 | 5e-13 | 0 | ~3% in 60s | ~33x too fast |
 | 4 | **1e-16** | **1e-14** | **0** | **12.8% in 1h** | **On target** |
 
-**Final calibration (Run 4):**
-- D_grain = 1e-16 m^2/s → D_interface_grain = 2e-16 m^2/s
-- D_gb = 1e-14 m^2/s → D_interface_gb = 2e-14 m^2/s
-- gb_width_cells = 0 (no GB dilation to avoid 76% GB coverage)
-- 1-hour diagnostic: 12.8% mass loss
-- Dissolution rate decelerates over time (surface area decreases):
-  early rate ~24%/h, later ~9%/h → extrapolates to ~45-55% at 9h
+**Note:** Runs 1-4 were invalidated by the advection-on-interface-bonds bug
+(Section 5.20). The 12.8% mass loss in Run 4 included spurious concentration
+injection from the advection operator (~40,000x larger than diffusion at
+stagnation points). With the fix (session 5), the corrected mass loss is
+~3%/h → parameters need recalibration.
 
 **Config:** `config/params_diagnostic.cfg` (1h diagnostic),
 `config/params_implicit_test.cfg` (full 9h production run).
@@ -1011,8 +1055,29 @@ Implicit solver fixes:
   Backward Euler is unconditionally stable, so larger dt is safe.
 - Added concentration upper clamping to C_solid_init (was unbounded above)
 
-Parameter calibration:
+Parameter calibration (invalidated by session 5 bug fix):
 - 5 iterative diagnostic runs to calibrate D_grain and D_gb (see 10.6)
 - Final: D_grain=1e-16, D_gb=1e-14, gb_width_cells=0
-- 1-hour diagnostic: 12.8% mass loss, extrapolates to ~50% at 9h
-- Updated all production configs with calibrated values
+- 1-hour diagnostic: 12.8% mass loss — later found to be inflated by
+  advection-on-interface-bonds bug (see Section 5.20)
+
+**2026-02-14 (session 5):**
+
+Critical bug fixes:
+- **Advection on interface bonds** (Section 5.20): PD advection `v . nabla C`
+  was applied to fluid-solid interface bonds, where w_adv/w_diff ~ 40,000x.
+  At stagnation points, this injected C=1.0 from solid into fluid.
+  Fix: restrict advection to fluid-fluid bonds only (`i_is_fluid && j_is_fluid`).
+  Applied to both `pd_ard.cpp` (explicit) and `pd_ard_implicit.cpp` (implicit).
+- **Flow re-solve after dissolution**: Previous threshold `n_dissolved >= 10`
+  was never met (nodes dissolve 1-2 at a time). Changed to always re-solve
+  when any dissolution occurs. Track cumulative `dissolved_since_flow_`.
+  Subsequent flow solves converge in 900-1500 iterations (warm start).
+- **Neighbor rebuild**: Now rebuilt after every dissolution event.
+
+Results after fix:
+- C_max_fluid = 5e-7 (was 1.0 with the bug)
+- 4 nodes dissolved in 1h (was 122)
+- pin_mass_loss = ~3% at 0.42h — dissolution now purely diffusion-driven
+- Runtime: 21s for 1h sim (was 618s due to pathological coupling loop)
+- Parameters need recalibration: D_grain likely needs 2-4x increase

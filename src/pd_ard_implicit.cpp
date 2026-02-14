@@ -206,9 +206,12 @@ void PD_ARD_ImplicitSolver::assemble(const Fields& fields, const Grid& grid,
 
                 double w_diff = beta_coeff_ * (D_avg + D_art) * inv_xi2 * V_j;
 
-                // Advection weight: only when node i is FLUID (solid nodes have v=0)
+                // Advection weight: fluid-fluid bonds only.
+                // Interface bonds (fluid-solid) carry ONLY diffusion —
+                // advection is a fluid-phase transport mechanism and does not
+                // apply across the solid-liquid interface (Jafarzadeh et al. 2018).
                 double w_adv = 0.0;
-                if (i_is_fluid) {
+                if (i_is_fluid && j_is_fluid) {
                     double vi_dot_e = dot(vel_i, e_ij);
                     w_adv = div_coeff * vi_dot_e * inv_xi * V_j;
                 }

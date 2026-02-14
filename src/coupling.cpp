@@ -113,6 +113,7 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
     double t_corr = 0.0;
     int cycle = 0;
     bool need_flow_solve = true; // always solve flow on first cycle
+    dissolved_since_flow_ = 0;
 
     while (t_corr < cfg.T_final) {
         cycle++;
@@ -121,14 +122,17 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
 
         // Phase 1: Solve flow to steady state (only when geometry changed)
         if (need_flow_solve) {
+            std::printf("  Flow re-solve triggered (%d nodes dissolved since last flow solve)\n",
+                        dissolved_since_flow_);
             flow_solver_.solve_steady(fields, grid, cfg);
+            dissolved_since_flow_ = 0;
 
             // Write flow solution (for debugging only — NOT added to PVD)
             fname = make_filename(cfg, "flow", t_corr, frame_count_);
             writer_.write(fname, grid, fields, cfg);
             frame_count_++;
         } else {
-            std::printf("  Skipping flow solve (no dissolution in previous cycle)\n");
+            std::printf("  Skipping flow solve (no dissolution since last flow solve)\n");
         }
 
         // Phase 2: Corrosion with frozen velocity field
@@ -212,18 +216,19 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
             ? ard_implicit_solver_.apply_phase_change(fields, grid, cfg)
             : ard_solver_.apply_phase_change(fields, grid, cfg);
         total_dissolved_ += n_dissolved;
-        // Only re-solve flow when enough nodes have dissolved to affect the velocity field
-        // (avoids expensive flow re-solve for every single dissolved node)
-        need_flow_solve = (n_dissolved >= 10);
+        dissolved_since_flow_ += n_dissolved;
         if (n_dissolved > 0) {
-            std::printf("  Phase change: %d nodes dissolved (total: %d)\n",
-                        n_dissolved, total_dissolved_);
+            std::printf("  Phase change: %d nodes dissolved (total: %d, since flow: %d)\n",
+                        n_dissolved, total_dissolved_, dissolved_since_flow_);
             update_node_types_after_dissolution(grid, fields);
 
-            if (n_dissolved > 10) {
-                std::printf("  Rebuilding neighbor list...\n");
-                grid.build_neighbors();
-            }
+            // Rebuild neighbor list so newly-FLUID nodes have correct bond structure
+            std::printf("  Rebuilding neighbor list...\n");
+            grid.build_neighbors();
+
+            // Re-solve flow next cycle: dissolved nodes are now interior fluid
+            // and need velocity/pressure computed by PD-NS
+            need_flow_solve = true;
         } else {
             std::printf("  No phase changes this cycle\n");
         }
