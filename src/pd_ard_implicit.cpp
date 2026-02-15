@@ -438,6 +438,15 @@ int PD_ARD_ImplicitSolver::step(Fields& fields, const Grid& grid,
 double PD_ARD_ImplicitSolver::compute_adaptive_dt(const Fields& fields,
                                                    const Grid& grid,
                                                    const Config& cfg) const {
+    // Precompute full M*C product to get dC/dt for all unknowns.
+    // NOTE: M_ is column-major (Eigen default), so InnerIterator(M_, k)
+    // iterates COLUMN k, not row k. Using SpMV avoids this pitfall entirely.
+    Eigen::VectorXd C_vec(n_unknowns_);
+    for (int k = 0; k < n_unknowns_; ++k) {
+        C_vec[k] = fields.C[local_to_global_[k]];
+    }
+    Eigen::VectorXd MC = M_ * C_vec;  // MC[k] = sum_j M[k,j]*C[j]
+
     double min_t_phase = cfg.implicit_dt_max;
     int N = grid.N_total;
 
@@ -449,18 +458,10 @@ double PD_ARD_ImplicitSolver::compute_adaptive_dt(const Fields& fields,
         int k = global_to_local_[i];
         if (k < 0) continue;
 
-        // Compute dC_i/dt from the M matrix row: dC/dt = sum_j M[k,j]*C[j]
-        // This includes all bonds (solid-solid and interface)
-        double dCdt = 0.0;
+        // dC/dt from M matrix row (via precomputed SpMV)
+        double dCdt = MC[k];
 
-        // Sparse row iteration
-        for (Eigen::SparseMatrix<double>::InnerIterator it(M_, k); it; ++it) {
-            int col = it.col();
-            int g = local_to_global_[col];
-            dCdt += it.value() * fields.C[g];
-        }
-
-        // Also add BC contribution
+        // Also add BC contribution (INLET/OUTLET neighbors)
         for (int p = bc_nbr_offset_[k]; p < bc_nbr_offset_[k + 1]; ++p) {
             dCdt += bc_nbr_weight_[p] * fields.C[bc_nbr_global_[p]];
         }

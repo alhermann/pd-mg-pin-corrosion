@@ -185,6 +185,9 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
                 // Smooth truncated PD neighborhoods near inlet/outlet
                 smooth_boundary_concentration(fields, grid, cfg);
 
+                // Update fictitious node C values after smoothing (AMR only)
+                if (cfg.use_amr) grid.update_fictitious(fields);
+
                 t_corr += dt_impl;
                 implicit_step++;
                 total_implicit_steps_++;

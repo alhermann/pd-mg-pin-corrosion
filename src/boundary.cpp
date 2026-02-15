@@ -143,17 +143,16 @@ void apply_outlet_bc(Fields& f, const Grid& g, const Config& cfg) {
 static void apply_wall_mirror_proper(Fields& f, const Grid& g,
                                       const Config& cfg, bool use_new) {
     int N = g.N_total;
+    bool is_amr = !g.dx_local.empty();
 
     #pragma omp parallel for schedule(static)
     for (int n = 0; n < N; ++n) {
         if (g.node_type[n] != WALL) continue;
 
-        int i_grid, j_grid, k_grid;
-        flat_to_ijk(n, g.Nx, g.Ny, i_grid, j_grid, k_grid);
+        // Use stored position (works for both uniform and AMR grids)
+        double x = g.pos[n][0];
 
-        double x = g.origin_x + i_grid * g.dx;
-
-        // --- Compute mirror x-coordinate across tube wall surface ---
+        // --- Compute mirror position across tube wall surface ---
         int mirror_idx = -1;
 
         if constexpr (DIM == 2) {
@@ -163,49 +162,94 @@ static void apply_wall_mirror_proper(Fields& f, const Grid& g,
             } else if (x < -cfg.R_tube) {
                 x_mirror = -2.0 * cfg.R_tube - x;
             } else {
-                // Wall node inside tube radius — shouldn't normally happen.
-                // Fall through to nearest-neighbour fallback.
+                // Wall node inside tube radius — fall through to fallback
                 goto fallback;
             }
 
-            int i_mirror = static_cast<int>(
-                std::round((x_mirror - g.origin_x) / g.dx));
-            int j_mirror = j_grid;  // same axial position
+            if (!is_amr) {
+                // Structured grid: compute mirror index from grid coordinates
+                int i_grid, j_grid, k_grid;
+                flat_to_ijk(n, g.Nx, g.Ny, i_grid, j_grid, k_grid);
 
-            if (i_mirror >= 0 && i_mirror < g.Nx &&
-                j_mirror >= 0 && j_mirror < g.Ny) {
-                int idx = g.idx(i_mirror, j_mirror, 0);
-                NodeType mt = g.node_type[idx];
-                if (mt == FLUID || mt == INLET || mt == OUTLET || mt == SOLID_MG)
-                    mirror_idx = idx;
+                int i_mirror = static_cast<int>(
+                    std::round((x_mirror - g.origin_x) / g.dx));
+                int j_mirror = j_grid;  // same axial position
+
+                if (i_mirror >= 0 && i_mirror < g.Nx &&
+                    j_mirror >= 0 && j_mirror < g.Ny) {
+                    int idx = g.idx(i_mirror, j_mirror, 0);
+                    NodeType mt = g.node_type[idx];
+                    if (mt == FLUID || mt == INLET || mt == OUTLET || mt == SOLID_MG)
+                        mirror_idx = idx;
+                }
+            } else {
+                // AMR: search PD neighborhood for node closest to mirror position
+                double y_wall = g.pos[n][1];
+                double best_d2 = 1e30;
+                for (int jj = g.nbr_offset[n]; jj < g.nbr_offset[n + 1]; ++jj) {
+                    int j = g.nbr_index[jj];
+                    NodeType mt = g.node_type[j];
+                    if (mt != FLUID && mt != INLET && mt != OUTLET &&
+                        mt != SOLID_MG && mt != FICTITIOUS)
+                        continue;
+                    double drx = g.pos[j][0] - x_mirror;
+                    double dry = g.pos[j][1] - y_wall;
+                    double d2 = drx * drx + dry * dry;
+                    if (d2 < best_d2) {
+                        best_d2 = d2;
+                        mirror_idx = j;
+                    }
+                }
             }
         } else {
             // 3D: cylindrical wall — mirror across r = R_tube
-            double y = g.origin_y + j_grid * g.dx;
+            double y = g.pos[n][1];
             double r = std::sqrt(x * x + y * y);
             if (r > cfg.R_tube && r > 1e-30) {
                 double r_mirror = 2.0 * cfg.R_tube - r;
                 double x_mirror = x * r_mirror / r;
                 double y_mirror = y * r_mirror / r;
 
-                int i_mirror = static_cast<int>(
-                    std::round((x_mirror - g.origin_x) / g.dx));
-                int j_mirror = static_cast<int>(
-                    std::round((y_mirror - g.origin_y) / g.dx));
-                int k_mirror = k_grid;
+                if (!is_amr) {
+                    int i_mirror = static_cast<int>(
+                        std::round((x_mirror - g.origin_x) / g.dx));
+                    int j_mirror = static_cast<int>(
+                        std::round((y_mirror - g.origin_y) / g.dx));
+                    int k_grid = n / (g.Nx * g.Ny);
+                    int k_mirror = k_grid;
 
-                if (i_mirror >= 0 && i_mirror < g.Nx &&
-                    j_mirror >= 0 && j_mirror < g.Ny &&
-                    k_mirror >= 0 && k_mirror < g.Nz) {
-                    int idx = g.idx(i_mirror, j_mirror, k_mirror);
-                    NodeType mt = g.node_type[idx];
-                    if (mt == FLUID || mt == INLET || mt == OUTLET || mt == SOLID_MG)
-                        mirror_idx = idx;
+                    if (i_mirror >= 0 && i_mirror < g.Nx &&
+                        j_mirror >= 0 && j_mirror < g.Ny &&
+                        k_mirror >= 0 && k_mirror < g.Nz) {
+                        int idx = g.idx(i_mirror, j_mirror, k_mirror);
+                        NodeType mt = g.node_type[idx];
+                        if (mt == FLUID || mt == INLET || mt == OUTLET || mt == SOLID_MG)
+                            mirror_idx = idx;
+                    }
+                } else {
+                    // AMR 3D: search PD neighborhood for closest to mirror point
+                    double z_wall = g.pos[n][2];
+                    double best_d2 = 1e30;
+                    for (int jj = g.nbr_offset[n]; jj < g.nbr_offset[n + 1]; ++jj) {
+                        int j = g.nbr_index[jj];
+                        NodeType mt = g.node_type[j];
+                        if (mt != FLUID && mt != INLET && mt != OUTLET &&
+                            mt != SOLID_MG && mt != FICTITIOUS)
+                            continue;
+                        double drx = g.pos[j][0] - x_mirror;
+                        double dry = g.pos[j][1] - y_mirror;
+                        double drz = g.pos[j][2] - z_wall;
+                        double d2 = drx * drx + dry * dry + drz * drz;
+                        if (d2 < best_d2) {
+                            best_d2 = d2;
+                            mirror_idx = j;
+                        }
+                    }
                 }
             }
         }
 
-        // --- Fallback: nearest fluid neighbour (original approach) ---
+        // --- Fallback: nearest fluid neighbour ---
         fallback:
         if (mirror_idx < 0) {
             double best_dist = 1e30;
