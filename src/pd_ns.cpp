@@ -14,6 +14,23 @@ void PD_NS_Solver::init(const Grid& grid, const Config& cfg) {
         V_H_ = (4.0 / 3.0) * PI * cfg.delta * cfg.delta * cfg.delta;
         beta_lap_ = 12.0 / (PI * cfg.delta * cfg.delta);
     }
+
+    // AMR: precompute per-node PD constants
+    if (cfg.use_amr) {
+        use_amr_ = true;
+        V_H_node_.resize(grid.N_total);
+        beta_lap_node_.resize(grid.N_total);
+        for (int i = 0; i < grid.N_total; ++i) {
+            double d = grid.delta_local[i];
+            if constexpr (DIM == 2) {
+                V_H_node_[i] = PI * d * d;
+                beta_lap_node_[i] = 4.0 / (PI * d * d);
+            } else {
+                V_H_node_[i] = (4.0 / 3.0) * PI * d * d * d;
+                beta_lap_node_[i] = 12.0 / (PI * d * d);
+            }
+        }
+    }
 }
 
 void PD_NS_Solver::compute_pressure(Fields& f, const Config& cfg) {
@@ -44,11 +61,15 @@ double PD_NS_Solver::compute_dt(const Fields& fields, const Grid& grid, const Co
         }
     }
 
-    double dt_cfl = cfg.dx / (cfg.c0 + v_max + 1e-30);
+    // Use finest grid spacing for stability limit
+    double dx_min = cfg.dx;
+    double delta_min = cfg.delta;
+
+    double dt_cfl = dx_min / (cfg.c0 + v_max + 1e-30);
     double nu = cfg.mu_f / cfg.rho_f;
-    double dt_visc = 0.25 * cfg.dx * cfg.dx / (nu + 1e-30);
-    double D_v = cfg.eta_density * cfg.c0 * cfg.delta;
-    double dt_dens = 0.25 * cfg.dx * cfg.dx / (D_v + 1e-30);
+    double dt_visc = 0.25 * dx_min * dx_min / (nu + 1e-30);
+    double D_v = cfg.eta_density * cfg.c0 * delta_min;
+    double dt_dens = 0.25 * dx_min * dx_min / (D_v + 1e-30);
 
     double dt = cfg.cfl_factor * std::min({dt_cfl, dt_visc, dt_dens});
     return dt;
@@ -58,27 +79,28 @@ void PD_NS_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, dou
     compute_pressure(fields, cfg);
 
     double mu = cfg.mu_f;
-    double delta = cfg.delta;
     double c0_local = cfg.c0;
-    double D_v = cfg.eta_density * c0_local * delta;
 
-    double inv_VH = 1.0 / V_H_;
     int N = grid.N_total;
-
-    double dens_diff_coeff = beta_lap_ * D_v;
 
     #pragma omp parallel for schedule(dynamic, 256)
     for (int i = 0; i < N; ++i) {
         NodeType nt = grid.node_type[i];
 
         // Only compute PD for FLUID nodes.
-        // All other node types (WALL, SOLID_MG, INLET, OUTLET, OUTSIDE)
-        // have their values set by boundary conditions, not PD evolution.
+        // All other node types (WALL, SOLID_MG, INLET, OUTLET, OUTSIDE, FICTITIOUS)
+        // have their values set by boundary conditions or IDW interpolation.
         if (nt != FLUID) {
             fields.rho_new[i] = fields.rho[i];
             fields.vel_new[i] = fields.vel[i];
             continue;
         }
+
+        double inv_VH = 1.0 / (use_amr_ ? V_H_node_[i] : V_H_);
+        double beta_l = use_amr_ ? beta_lap_node_[i] : beta_lap_;
+        double delta_i = use_amr_ ? grid.delta_local[i] : cfg.delta;
+        double D_v = cfg.eta_density * c0_local * delta_i;
+        double dens_diff_coeff = beta_l * D_v;
 
         double rho_i = fields.rho[i];
         Vec vel_i = fields.vel[i];
@@ -151,7 +173,7 @@ void PD_NS_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, dou
             fields.vel_new[i][d] = vel_i[d] + dt * inv_rho * (
                 -(alpha_ * inv_VH) * mom_conv[d]
                 -(alpha_ * inv_VH) * mom_pres[d]
-                + mu * beta_lap_ * mom_visc[d]
+                + mu * beta_l * mom_visc[d]
             );
         }
     }
@@ -226,19 +248,23 @@ int PD_NS_Solver::solve_steady(Fields& fields, const Grid& grid, const Config& c
                 diverged = true;
                 break;
             }
+
+            // Convergence check (only when epsilon was just recomputed)
+            if (epsilon < cfg.flow_conv_tol && iter > 100) {
+                std::printf("  Flow converged at iter %d, eps=%.3e\n", iter, epsilon);
+                break;
+            }
         }
 
         // Swap buffers
         fields.swap_buffers();
 
+        // Update fictitious node values from IDW sources (AMR only)
+        if (use_amr_) grid.update_fictitious(fields);
+
         // Recompute dt periodically
         if (iter % 200 == 0) {
             dt = compute_dt(fields, grid, cfg);
-        }
-
-        if (epsilon < cfg.flow_conv_tol && iter > 100) {
-            std::printf("  Flow converged at iter %d, eps=%.3e\n", iter, epsilon);
-            break;
         }
     }
 

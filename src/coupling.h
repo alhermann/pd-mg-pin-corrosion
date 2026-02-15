@@ -15,12 +15,15 @@ private:
     PD_NS_Solver flow_solver_;
     PD_ARD_Solver ard_solver_;
     PD_ARD_ImplicitSolver ard_implicit_solver_;
-    VTKWriter writer_;
+    VTKWriter writer_;        // corrosion snapshots → simulation.pvd
+    VTKWriter flow_writer_;   // flow snapshots → flow.pvd
 
     int initial_solid_count_ = 0;
+    std::vector<int> initial_solid_indices_;  // node indices that started as SOLID_MG
     int total_dissolved_ = 0;
     int dissolved_since_flow_ = 0;  // cumulative since last flow re-solve
     int frame_count_ = 0;
+    int total_implicit_steps_ = 0;  // persistent across coupling cycles
 
     std::string make_filename(const Config& cfg, const std::string& prefix,
                               double time_s, int frame);

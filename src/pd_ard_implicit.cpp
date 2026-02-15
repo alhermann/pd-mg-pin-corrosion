@@ -18,6 +18,23 @@ void PD_ARD_ImplicitSolver::init(const Grid& grid, const Config& cfg) {
         V_H_ = (4.0 / 3.0) * PI * cfg.delta * cfg.delta * cfg.delta;
         beta_coeff_ = 12.0 / (PI * cfg.delta * cfg.delta);
     }
+
+    // AMR: precompute per-node PD constants
+    if (cfg.use_amr) {
+        use_amr_ = true;
+        V_H_node_.resize(grid.N_total);
+        beta_node_.resize(grid.N_total);
+        for (int i = 0; i < grid.N_total; ++i) {
+            double d = grid.delta_local[i];
+            if constexpr (DIM == 2) {
+                V_H_node_[i] = PI * d * d;
+                beta_node_[i] = 4.0 / (PI * d * d);
+            } else {
+                V_H_node_[i] = (4.0 / 3.0) * PI * d * d * d;
+                beta_node_[i] = 12.0 / (PI * d * d);
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -32,7 +49,8 @@ void PD_ARD_ImplicitSolver::build_index_map(const Grid& grid) {
 
     int idx = 0;
     for (int i = 0; i < N; ++i) {
-        if (grid.node_type[i] == FLUID || grid.node_type[i] == SOLID_MG) {
+        if (grid.node_type[i] == FLUID || grid.node_type[i] == SOLID_MG ||
+            grid.node_type[i] == FICTITIOUS) {
             global_to_local_[i] = idx;
             local_to_global_.push_back(i);
             idx++;
@@ -89,19 +107,28 @@ void PD_ARD_ImplicitSolver::assemble(const Fields& fields, const Grid& grid,
 
     build_index_map(grid);
 
-    // Count fluid and solid unknowns for logging
-    int n_fluid = 0, n_solid = 0;
+    // Count unknowns by type for logging
+    int n_fluid = 0, n_solid = 0, n_fict = 0;
     for (int k = 0; k < n_unknowns_; ++k) {
-        if (grid.node_type[local_to_global_[k]] == FLUID) n_fluid++;
-        else n_solid++;
+        NodeType nt = grid.node_type[local_to_global_[k]];
+        if (nt == FLUID) n_fluid++;
+        else if (nt == SOLID_MG) n_solid++;
+        else if (nt == FICTITIOUS) n_fict++;
     }
-    std::printf("  Implicit: %d unknowns (%d fluid + %d solid)\n",
-                n_unknowns_, n_fluid, n_solid);
+    std::printf("  Implicit: %d unknowns (%d fluid + %d solid + %d fictitious)\n",
+                n_unknowns_, n_fluid, n_solid, n_fict);
 
     // Precompute salt-layer blocking
     compute_salt_blocked(fields, grid, cfg);
 
-    double div_coeff = alpha_p_ / V_H_;
+    // Volume-loss-dependent decay factor (Hermann et al. 2022, Eq. 42):
+    // decay = 10^(-V_L / l), reduces interface micro-diffusivity as corrosion progresses
+    double decay_factor = 1.0;
+    if (cfg.corrosion_decay_l > 0.0) {
+        decay_factor = std::pow(10.0, -volume_loss_fraction_ / cfg.corrosion_decay_l);
+        std::printf("  Interface decay: V_L=%.4f, l=%.3f, factor=%.6f\n",
+                    volume_loss_fraction_, cfg.corrosion_decay_l, decay_factor);
+    }
 
     using Triplet = Eigen::Triplet<double>;
     std::vector<Triplet> triplets;
@@ -131,17 +158,38 @@ void PD_ARD_ImplicitSolver::assemble(const Fields& fields, const Grid& grid,
         for (int k = 0; k < n_unknowns_; ++k) {
             int i = local_to_global_[k];
             NodeType nt_i = grid.node_type[i];
+
+            // FICTITIOUS nodes: zero M row (coupling added after A = I - dt*M)
+            // Pre-allocate sparsity pattern for IDW coupling entries
+            if (nt_i == FICTITIOUS) {
+                my_triplets.emplace_back(k, k, 0.0);
+                for (int p = grid.fict_offset[i]; p < grid.fict_offset[i + 1]; ++p) {
+                    int j = grid.fict_source[p];
+                    int col = global_to_local_[j];
+                    if (col >= 0) {
+                        my_triplets.emplace_back(k, col, 0.0);
+                    }
+                }
+                continue;
+            }
+
             bool i_is_fluid = (nt_i == FLUID);
             bool i_is_solid = (nt_i == SOLID_MG);
             bool i_is_gb = fields.is_gb[i];
             bool i_salt_blocked = i_is_solid && salt_blocked_[i];
 
-            // Solid micro-diffusivity for node i
-            double D_solid_i = i_is_gb ? cfg.D_gb : cfg.D_grain;
+            // Solid micro-diffusivity for node i: GB > precipitate > grain
+            double D_solid_i = i_is_gb ? cfg.D_gb
+                             : (fields.is_precip[i] ? cfg.D_precip : cfg.D_grain);
+            (void)D_solid_i;
+
+            // Per-node PD constants
+            double beta_i = use_amr_ ? beta_node_[i] : beta_coeff_;
+            double V_H_i = use_amr_ ? V_H_node_[i] : V_H_;
+            double div_coeff = alpha_p_ / V_H_i;
 
             // Velocity (only fluid nodes have nonzero velocity)
             Vec vel_i = i_is_fluid ? fields.vel[i] : vec_zero();
-            double vi_mag = i_is_fluid ? norm(vel_i) : 0.0;
 
             double diag = 0.0;
 
@@ -165,7 +213,9 @@ void PD_ARD_ImplicitSolver::assemble(const Fields& fields, const Grid& grid,
                 //   Liquid-Liquid:  D_liquid + advection
                 //   Interface:      harmonic_mean(D_liquid, D_solid) + advection on fluid side
                 //   Solid-Solid:    skip (no transport within solid bulk)
-                bool j_is_fluid = (nt_j == FLUID || nt_j == INLET || nt_j == OUTLET);
+                //   FICTITIOUS neighbors: treated like FLUID for bond classification
+                //   (valid when amr_buffer > delta_c, ensuring all aux nodes are in fluid region)
+                bool j_is_fluid = (nt_j == FLUID || nt_j == INLET || nt_j == OUTLET || nt_j == FICTITIOUS);
                 bool j_is_solid = (nt_j == SOLID_MG);
 
                 // Skip solid-solid bonds (no diffusion within bulk solid)
@@ -173,55 +223,74 @@ void PD_ARD_ImplicitSolver::assemble(const Fields& fields, const Grid& grid,
 
                 double D_avg = 0.0;
                 if (i_is_fluid && j_is_fluid) {
-                    // Liquid-Liquid bond
+                    // Liquid-Liquid bond (including FICTITIOUS)
                     D_avg = cfg.D_liquid;
-                } else {
-                    // Interface bond (one fluid, one solid):
-                    // harmonic mean of D_liquid and D_solid
-                    bool solid_is_gb;
-                    bool solid_salt_blocked;
-                    if (i_is_solid) {
-                        solid_is_gb = i_is_gb;
-                        solid_salt_blocked = i_salt_blocked;
-                    } else {
-                        solid_is_gb = fields.is_gb[j];
-                        solid_salt_blocked = salt_blocked_[j];
-                    }
-
-                    // Salt-layer blocking: disable interface bonds for blocked solid nodes
+                } else if ((i_is_fluid || nt_i == FICTITIOUS) && j_is_solid) {
+                    // Interface bond: fluid/fictitious i, solid j
+                    bool solid_is_gb = fields.is_gb[j];
+                    bool solid_salt_blocked = salt_blocked_[j];
                     if (solid_salt_blocked) {
                         D_avg = 0.0;
                     } else {
-                        double D_s = solid_is_gb ? cfg.D_gb : cfg.D_grain;
+                        double D_s = solid_is_gb ? cfg.D_gb
+                                   : (fields.is_precip[j] ? cfg.D_precip : cfg.D_grain);
+                        D_s *= decay_factor;  // volume-loss decay (Eq. 42)
+                        D_avg = 2.0 * cfg.D_liquid * D_s / (cfg.D_liquid + D_s + 1e-30);
+                    }
+                } else if (i_is_solid && j_is_fluid) {
+                    // Interface bond: solid i, fluid/fictitious j
+                    bool solid_is_gb = i_is_gb;
+                    bool solid_salt_blocked = i_salt_blocked;
+                    if (solid_salt_blocked) {
+                        D_avg = 0.0;
+                    } else {
+                        double D_s = solid_is_gb ? cfg.D_gb
+                                   : (fields.is_precip[i] ? cfg.D_precip : cfg.D_grain);
+                        D_s *= decay_factor;  // volume-loss decay (Eq. 42)
                         D_avg = 2.0 * cfg.D_liquid * D_s / (cfg.D_liquid + D_s + 1e-30);
                     }
                 }
 
-                // Artificial diffusion (only for liquid-liquid bonds with velocity)
-                double D_art = 0.0;
+                // ---------------------------------------------------------
+                // Diffusion + non-conservative advection with M-matrix
+                // upwind stabilization (gradient form)
+                //
+                // Diffusion:  β * D / ξ² * (C_j - C_i) * V_j
+                //
+                // Advection (gradient/non-conservative form):
+                //   (α/V_H) * (v_i · e_ij) * (C_j - C_i) / ξ * V_j
+                //
+                // Upwind stabilization (per-bond, anisotropic):
+                //   For downwind bonds (v·e > 0) where the advection coeff
+                //   exceeds diffusion, add minimum artificial diffusion in
+                //   the bond direction to keep off-diagonal ≥ 0.
+                //   - Upwind bonds (v·e < 0): untouched (already positive)
+                //   - Cross-flow bonds (v·e ≈ 0): untouched (pure diffusion)
+                //   This gives monotone solutions at high Pe with artificial
+                //   diffusion ONLY in the flow direction.
+                // ---------------------------------------------------------
+
+                // Diffusion contribution (all bond types)
+                double w_diff = beta_i * D_avg * inv_xi2 * V_j;
+                double w_ij      = w_diff;   // off-diagonal (C_j coefficient)
+                double w_ii_bond = w_diff;   // diagonal contribution (C_i)
+
+                // Advection on liquid-liquid bonds only
                 if (i_is_fluid && j_is_fluid) {
-                    double vj_mag = norm(fields.vel[j]);
-                    D_art = cfg.alpha_art_diff * std::max(vi_mag, vj_mag) * cfg.dx;
+                    double v_dot_e = dot(vel_i, e_ij);
+                    double w_adv = div_coeff * v_dot_e * inv_xi * V_j;
+
+                    // Per-bond upwind stabilization: clamp off-diagonal ≥ 0
+                    double w_stab = std::max(0.0, w_adv - w_diff);
+
+                    w_ij      = (w_diff + w_stab) - w_adv;  // ≥ 0 guaranteed
+                    w_ii_bond = (w_diff + w_stab) - w_adv;  // symmetric per bond
                 }
 
-                double w_diff = beta_coeff_ * (D_avg + D_art) * inv_xi2 * V_j;
-
-                // Advection weight: fluid-fluid bonds only.
-                // Interface bonds (fluid-solid) carry ONLY diffusion —
-                // advection is a fluid-phase transport mechanism and does not
-                // apply across the solid-liquid interface (Jafarzadeh et al. 2018).
-                double w_adv = 0.0;
-                if (i_is_fluid && j_is_fluid) {
-                    double vi_dot_e = dot(vel_i, e_ij);
-                    w_adv = div_coeff * vi_dot_e * inv_xi * V_j;
-                }
-
-                double w_ij = w_diff - w_adv;
-
-                diag -= w_ij;
+                diag -= w_ii_bond;
 
                 // Off-diagonal entry
-                if (nt_j == FLUID || nt_j == SOLID_MG) {
+                if (nt_j == FLUID || nt_j == SOLID_MG || nt_j == FICTITIOUS) {
                     int col_j = global_to_local_[j];
                     if (col_j >= 0) {
                         my_triplets.emplace_back(k, col_j, w_ij);
@@ -321,6 +390,11 @@ int PD_ARD_ImplicitSolver::step(Fields& fields, const Grid& grid,
     // RHS: b = C_old + dt * bc_rhs
     Eigen::VectorXd b = C_old + dt * bc_rhs;
 
+    // Apply fictitious node coupling (overwrite FICTITIOUS rows in A and b)
+    if (use_amr_) {
+        apply_fictitious_coupling(A, b, grid, fields);
+    }
+
     // Solve A * C_new = b with GMRES + ILU preconditioner
     Eigen::GMRES<Eigen::SparseMatrix<double>, Eigen::IncompleteLUT<double>> gmres;
     gmres.setMaxIterations(200);
@@ -411,6 +485,52 @@ double PD_ARD_ImplicitSolver::compute_adaptive_dt(const Fields& fields,
     dt = std::max(dt, cfg.implicit_dt_max * 0.01);
 
     return dt;
+}
+
+// ============================================================================
+// Phase change: dissolve solid nodes below C_thresh
+// ============================================================================
+
+// ============================================================================
+// Fictitious node coupling: overwrite FICTITIOUS rows with IDW constraint
+// C_fict = sum(w_j * C_source_j) => row: A[k,k]=1, A[k,source_j]=-w_j, b[k]=0
+// ============================================================================
+
+void PD_ARD_ImplicitSolver::apply_fictitious_coupling(
+    Eigen::SparseMatrix<double>& A, Eigen::VectorXd& b,
+    const Grid& grid, const Fields& fields)
+{
+    if (grid.fict_offset.empty()) return;
+
+    for (int i = 0; i < grid.N_total; ++i) {
+        if (grid.node_type[i] != FICTITIOUS) continue;
+        int k = global_to_local_[i];
+        if (k < 0) continue;
+
+        // Row k of A is already [0,...,0,1,0,...,0] from A = I - dt*M
+        // (FICTITIOUS rows in M are zero). The sparsity pattern was pre-allocated
+        // in assemble() with zero-valued IDW entries. Just set the values.
+        //
+        // Constraint: C_fict = sum(w_j * C_source_j)
+        // => A[k,k]*C_k + sum_j A[k,col_j]*C_j = b[k]
+        // => 1*C_k - sum(w_j * C_j for unknowns) = sum(w_j * C_j for BCs)
+
+        A.coeffRef(k, k) = 1.0;
+        double bc_sum = 0.0;
+
+        for (int p = grid.fict_offset[i]; p < grid.fict_offset[i + 1]; ++p) {
+            int j = grid.fict_source[p];
+            int col = global_to_local_[j];
+            if (col >= 0) {
+                A.coeffRef(k, col) = -grid.fict_weight[p];
+            } else {
+                // BC node (INLET/OUTLET/WALL): contribution goes to RHS
+                bc_sum += grid.fict_weight[p] * fields.C[j];
+            }
+        }
+
+        b[k] = bc_sum;
+    }
 }
 
 // ============================================================================

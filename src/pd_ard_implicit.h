@@ -12,6 +12,9 @@ class PD_ARD_ImplicitSolver {
 public:
     void init(const Grid& grid, const Config& cfg);
 
+    // Set current volume loss fraction [0,1] for decay model (call before assemble)
+    void set_volume_loss(double vl) { volume_loss_fraction_ = vl; }
+
     // Build sparse matrix M from PD transport operators (call once per coupling cycle)
     void assemble(const Fields& fields, const Grid& grid, const Config& cfg);
 
@@ -28,13 +31,21 @@ public:
     int apply_phase_change(Fields& fields, Grid& grid, const Config& cfg);
 
 private:
-    // PD coefficients
+    // PD coefficients (uniform grid)
     double alpha_p_;
     double V_H_;
     double beta_coeff_;
 
+    // Volume-loss-dependent decay (Hermann et al. 2022, Eq. 42)
+    double volume_loss_fraction_ = 0.0;
+
+    // Per-node PD constants (only for AMR)
+    bool use_amr_ = false;
+    std::vector<double> V_H_node_;
+    std::vector<double> beta_node_;
+
     // Global-to-local index map: global node index -> local unknown index
-    // (-1 if not an unknown, i.e. not FLUID or SOLID_MG)
+    // (-1 if not an unknown, i.e. not FLUID or SOLID_MG or FICTITIOUS)
     std::vector<int> global_to_local_;
     // Local-to-global: local unknown index -> global node index
     std::vector<int> local_to_global_;
@@ -59,4 +70,10 @@ private:
 
     // Precompute salt-layer blocking flags for solid nodes
     void compute_salt_blocked(const Fields& fields, const Grid& grid, const Config& cfg);
+
+    // Apply fictitious node coupling to the system matrix and RHS
+    void apply_fictitious_coupling(Eigen::SparseMatrix<double>& A,
+                                    Eigen::VectorXd& b,
+                                    const Grid& grid,
+                                    const Fields& fields);
 };

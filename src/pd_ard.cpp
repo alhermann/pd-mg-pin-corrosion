@@ -13,6 +13,22 @@ void PD_ARD_Solver::init(const Grid& grid, const Config& cfg) {
         V_H_ = (4.0 / 3.0) * PI * cfg.delta * cfg.delta * cfg.delta;
         beta_coeff_ = 12.0 / (PI * cfg.delta * cfg.delta);
     }
+
+    if (cfg.use_amr) {
+        use_amr_ = true;
+        V_H_node_.resize(grid.N_total);
+        beta_node_.resize(grid.N_total);
+        for (int i = 0; i < grid.N_total; ++i) {
+            double d = grid.delta_local[i];
+            if constexpr (DIM == 2) {
+                V_H_node_[i] = PI * d * d;
+                beta_node_[i] = 4.0 / (PI * d * d);
+            } else {
+                V_H_node_[i] = (4.0 / 3.0) * PI * d * d * d;
+                beta_node_[i] = 12.0 / (PI * d * d);
+            }
+        }
+    }
 }
 
 double PD_ARD_Solver::compute_dt(const Fields& fields, const Grid& grid, const Config& cfg) {
@@ -38,7 +54,6 @@ double PD_ARD_Solver::compute_dt(const Fields& fields, const Grid& grid, const C
 
 void PD_ARD_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, double dt) {
     int N = grid.N_total;
-    double div_coeff = alpha_p_ / V_H_;
 
     // Precompute salt-layer blocking flags for solid nodes
     // (Jafarzadeh et al. 2018): if a solid node has ANY liquid neighbor
@@ -57,12 +72,18 @@ void PD_ARD_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, do
         }
     }
 
+    // Volume-loss-dependent decay factor (Hermann et al. 2022, Eq. 42)
+    double decay_factor = 1.0;
+    if (cfg.corrosion_decay_l > 0.0) {
+        decay_factor = std::pow(10.0, -volume_loss_fraction_ / cfg.corrosion_decay_l);
+    }
+
     #pragma omp parallel for schedule(dynamic, 256)
     for (int i = 0; i < N; ++i) {
         NodeType nt_i = grid.node_type[i];
 
-        // Skip wall, inlet, outlet, outside — values set by BCs
-        if (nt_i == WALL || nt_i == INLET || nt_i == OUTLET || nt_i == OUTSIDE) {
+        // Skip wall, inlet, outlet, outside, fictitious — values set by BCs/IDW
+        if (nt_i == WALL || nt_i == INLET || nt_i == OUTLET || nt_i == OUTSIDE || nt_i == FICTITIOUS) {
             fields.C_new[i] = fields.C[i];
             continue;
         }
@@ -72,6 +93,11 @@ void PD_ARD_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, do
         bool i_is_solid = (nt_i == SOLID_MG);
         bool i_is_gb = fields.is_gb[i];
         bool i_salt_blocked = i_is_solid && salt_blocked[i];
+
+        // Per-node PD constants
+        double beta_i = use_amr_ ? beta_node_[i] : beta_coeff_;
+        double V_H_i = use_amr_ ? V_H_node_[i] : V_H_;
+        double div_coeff = alpha_p_ / V_H_i;
 
         // Velocity (only fluid nodes)
         Vec vel_i = i_is_fluid ? fields.vel[i] : vec_zero();
@@ -101,7 +127,7 @@ void PD_ARD_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, do
             //   Liquid-Liquid:  D_liquid + advection
             //   Interface:      harmonic_mean(D_liquid, D_solid) + advection on fluid side
             //   Solid-Solid:    skip (no transport within solid bulk)
-            bool j_is_fluid = (nt_j == FLUID || nt_j == INLET || nt_j == OUTLET);
+            bool j_is_fluid = (nt_j == FLUID || nt_j == INLET || nt_j == OUTLET || nt_j == FICTITIOUS);
             bool j_is_solid = (nt_j == SOLID_MG);
 
             // Skip solid-solid bonds (no diffusion within bulk solid)
@@ -127,12 +153,16 @@ void PD_ARD_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, do
                 if (solid_salt_blocked) {
                     D_avg = 0.0;
                 } else {
-                    double D_s = solid_is_gb ? cfg.D_gb : cfg.D_grain;
+                    int solid_idx = i_is_solid ? i : j;
+                    double D_s = solid_is_gb ? cfg.D_gb
+                               : (fields.is_precip[solid_idx] ? cfg.D_precip : cfg.D_grain);
+                    D_s *= decay_factor;  // volume-loss decay (Eq. 42)
                     D_avg = 2.0 * cfg.D_liquid * D_s / (cfg.D_liquid + D_s + 1e-30);
                 }
             }
 
             // Artificial diffusion (only for liquid-liquid bonds with velocity)
+            // Use uniform cfg.dx for all bonds to avoid discontinuity at AMR transition
             double D_art = 0.0;
             if (i_is_fluid && j_is_fluid) {
                 double vj_mag = norm(fields.vel[j]);
@@ -140,7 +170,7 @@ void PD_ARD_Solver::step(Fields& fields, const Grid& grid, const Config& cfg, do
             }
 
             // PD diffusion
-            diff_sum += beta_coeff_ * (D_avg + D_art) * (C_j - C_i) * inv_xi2 * V_j;
+            diff_sum += beta_i * (D_avg + D_art) * (C_j - C_i) * inv_xi2 * V_j;
 
             // Advection: non-conservative form v_i . e_ij (fluid-fluid bonds only).
             // Interface bonds (fluid-solid) carry ONLY diffusion —

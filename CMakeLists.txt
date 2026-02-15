@@ -66,6 +66,21 @@ target_include_directories(test_implicit PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(test_implicit PRIVATE PD_DIM=${PD_DIM})
 target_link_libraries(test_implicit PRIVATE OpenMP::OpenMP_CXX Eigen3::Eigen)
 
+# AMR validation tests
+add_executable(test_amr
+    tests/test_amr.cpp
+    src/config.cpp
+    src/grid.cpp
+    src/pd_ns.cpp
+    src/pd_ard.cpp
+    src/pd_ard_implicit.cpp
+    src/boundary.cpp
+    src/vtk_writer.cpp
+)
+target_include_directories(test_amr PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_amr PRIVATE PD_DIM=${PD_DIM})
+target_link_libraries(test_amr PRIVATE OpenMP::OpenMP_CXX Eigen3::Eigen)
+
 # Release by default
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)

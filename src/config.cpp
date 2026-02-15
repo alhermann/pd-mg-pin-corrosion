@@ -55,6 +55,8 @@ void Config::load(const std::string& filename) {
         else if (key == "D_liquid")          D_liquid = std::stod(val);
         else if (key == "D_grain")           D_grain = std::stod(val);
         else if (key == "D_gb")              D_gb = std::stod(val);
+        else if (key == "D_precip")          D_precip = std::stod(val);
+        else if (key == "precip_fraction")   precip_fraction = std::stod(val);
         else if (key == "C_solid_init")      C_solid_init = std::stod(val);
         else if (key == "C_liquid_init")     C_liquid_init = std::stod(val);
         else if (key == "C_thresh")          C_thresh = std::stod(val);
@@ -63,6 +65,8 @@ void Config::load(const std::string& filename) {
         else if (key == "grain_size_mean")   grain_size_mean = std::stod(val);
         else if (key == "grain_size_std")    grain_size_std = std::stod(val);
         else if (key == "gb_width_cells")    gb_width_cells = std::stoi(val);
+        else if (key == "precip_cluster_cells") precip_cluster_cells = std::stoi(val);
+        else if (key == "corrosion_decay_l") corrosion_decay_l = std::stod(val);
         else if (key == "cfl_factor")        cfl_factor = std::stod(val);
         else if (key == "cfl_factor_corr")  cfl_factor_corr = std::stod(val);
         else if (key == "flow_max_iters")    flow_max_iters = std::stoi(val);
@@ -76,8 +80,12 @@ void Config::load(const std::string& filename) {
         else if (key == "implicit_dt_fraction")  implicit_dt_fraction = std::stod(val);
         else if (key == "implicit_dt_max")       implicit_dt_max = std::stod(val);
         else if (key == "implicit_output_every") implicit_output_every = std::stoi(val);
+        else if (key == "diagnostic_every")    diagnostic_every = std::stoi(val);
         else if (key == "newton_tol")            newton_tol = std::stod(val);
         else if (key == "newton_max_iter")       newton_max_iter = std::stoi(val);
+        else if (key == "use_amr")              use_amr = std::stoi(val);
+        else if (key == "amr_ratio")            amr_ratio = std::stoi(val);
+        else if (key == "amr_buffer")           amr_buffer = std::stod(val);
         else {
             std::cerr << "Warning: Unknown config key '" << key << "'\n";
         }
@@ -88,6 +96,8 @@ void Config::load(const std::string& filename) {
 
 void Config::compute_derived() {
     delta = m_ratio * dx;
+    dx_coarse = amr_ratio * dx;
+    delta_coarse = m_ratio * dx_coarse;
 
     // Compute inlet velocity from volumetric flow rate
     // U_in = Q / A where A = pi * R_tube^2 (circular tube cross-section)
@@ -116,6 +126,11 @@ void Config::print() const {
     std::printf("  D_liquid     = %.2e m2/s\n", D_liquid);
     std::printf("  D_grain      = %.2e m2/s\n", D_grain);
     std::printf("  D_gb         = %.2e m2/s\n", D_gb);
+    std::printf("  D_precip     = %.2e m2/s\n", D_precip);
+    std::printf("  precip_frac  = %.3f\n", precip_fraction);
+    std::printf("  precip_clust = %d cells\n", precip_cluster_cells);
+    std::printf("  corr_decay_l = %.3f%s\n", corrosion_decay_l,
+                corrosion_decay_l > 0 ? "" : " (disabled)");
     std::printf("  C_sat        = %.2f\n", C_sat);
     std::printf("  T_final      = %.1f s (%.2f h)\n", T_final, T_final / 3600.0);
     std::printf("  output_dir   = %s\n", output_dir.c_str());

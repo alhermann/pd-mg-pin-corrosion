@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cmath>
 #include <limits>
+#include <algorithm>
 #include <omp.h>
 
 void GrainStructure::generate(const Grid& grid, const Config& cfg, int seed) {
@@ -111,6 +112,68 @@ void GrainStructure::generate(const Grid& grid, const Config& cfg, int seed) {
     }
     std::printf("Grain boundaries: %d nodes (%.1f%% of solid)\n",
                 n_gb, 100.0 * n_gb / solid_nodes.size());
+
+    // Scatter precipitates randomly in grain interiors (non-GB solid nodes)
+    // If precip_cluster_cells > 0, each seed grows into a cluster of that radius.
+    is_precipitate.resize(N, false);
+    if (cfg.precip_fraction > 0.0) {
+        std::vector<int> interior_nodes;
+        for (int ni : solid_nodes) {
+            if (!is_grain_boundary[ni]) interior_nodes.push_back(ni);
+        }
+
+        // Estimate seed count: if clustering, each seed covers ~pi*r^2 cells,
+        // so reduce seed count accordingly to maintain the target fraction.
+        double cells_per_cluster = 1.0;
+        if (cfg.precip_cluster_cells > 0) {
+            double r = cfg.precip_cluster_cells;
+            cells_per_cluster = (DIM == 2) ? PI * r * r : (4.0/3.0) * PI * r * r * r;
+        }
+        int n_seeds = static_cast<int>(interior_nodes.size() * cfg.precip_fraction
+                                        / cells_per_cluster);
+        n_seeds = std::max(1, n_seeds);
+
+        std::shuffle(interior_nodes.begin(), interior_nodes.end(), rng);
+        n_seeds = std::min(n_seeds, (int)interior_nodes.size());
+
+        // Mark seed nodes
+        for (int p = 0; p < n_seeds; ++p) {
+            is_precipitate[interior_nodes[p]] = true;
+        }
+
+        // Grow clusters around seeds if precip_cluster_cells > 0
+        if (cfg.precip_cluster_cells > 0) {
+            double cluster_r = cfg.precip_cluster_cells * cfg.dx;
+            std::vector<bool> is_seed(N, false);
+            for (int p = 0; p < n_seeds; ++p) {
+                is_seed[interior_nodes[p]] = true;
+            }
+            // Mark all interior nodes within cluster_r of any seed
+            #pragma omp parallel for schedule(dynamic, 256)
+            for (int idx = 0; idx < (int)solid_nodes.size(); ++idx) {
+                int ni = solid_nodes[idx];
+                if (is_grain_boundary[ni]) continue;
+                if (is_precipitate[ni]) continue;
+                const Vec& pi = grid.pos[ni];
+                for (int p = 0; p < n_seeds; ++p) {
+                    int si = interior_nodes[p];
+                    double d = norm(pi - grid.pos[si]);
+                    if (d <= cluster_r) {
+                        is_precipitate[ni] = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        int n_precip_actual = 0;
+        for (int ni : solid_nodes) {
+            if (is_precipitate[ni]) n_precip_actual++;
+        }
+        std::printf("Precipitates: %d nodes (%.1f%% of solid), cluster_r=%d cells\n",
+                    n_precip_actual, 100.0 * n_precip_actual / solid_nodes.size(),
+                    cfg.precip_cluster_cells);
+    }
 
     t.report();
 }

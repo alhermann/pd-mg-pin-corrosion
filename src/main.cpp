@@ -45,9 +45,11 @@ static void initialize_fields(Fields& fields, const Grid& grid,
                 fields.C[i] = cfg.C_solid_init;
                 fields.phase[i] = 0; // solid
 
-                // Set diffusivity based on grain structure
+                // Set diffusivity based on grain structure: GB > precipitate > grain
                 if (grains.is_grain_boundary[i]) {
                     fields.D_map[i] = cfg.D_gb;
+                } else if (grains.is_precipitate.size() > 0 && grains.is_precipitate[i]) {
+                    fields.D_map[i] = cfg.D_precip;
                 } else {
                     fields.D_map[i] = cfg.D_grain;
                 }
@@ -102,11 +104,20 @@ static void initialize_fields(Fields& fields, const Grid& grid,
                 fields.D_map[i] = 0.0;
                 fields.phase[i] = 1;
                 break;
+
+            case FICTITIOUS:
+                fields.rho[i] = cfg.rho_f;
+                fields.vel[i] = vec_zero();
+                fields.C[i] = 0.0;
+                fields.D_map[i] = cfg.D_liquid;
+                fields.phase[i] = 1;
+                break;
         }
 
-        // Copy grain_id and grain boundary flag
+        // Copy grain_id, grain boundary flag, and precipitate flag
         fields.grain_id[i] = grains.grain_id[i];
         fields.is_gb[i] = grains.is_grain_boundary[i] ? 1 : 0;
+        fields.is_precip[i] = grains.is_precipitate.size() > 0 && grains.is_precipitate[i] ? 1 : 0;
     }
 
     // Copy to new buffers
@@ -137,8 +148,13 @@ int main(int argc, char* argv[]) {
     // Build grid
     std::printf("Building grid...\n");
     Grid grid;
-    grid.build(cfg);
-    grid.build_neighbors();
+    if (cfg.use_amr) {
+        grid.build_amr(cfg);
+        grid.build_neighbors_celllist(cfg);
+    } else {
+        grid.build(cfg);
+        grid.build_neighbors();
+    }
 
     // Generate grain structure
     std::printf("Generating grain structure...\n");

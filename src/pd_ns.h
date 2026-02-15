@@ -2,6 +2,7 @@
 #include "grid.h"
 #include "fields.h"
 #include "config.h"
+#include <vector>
 
 class PD_NS_Solver {
 public:
@@ -17,8 +18,13 @@ public:
 
 private:
     double alpha_;      // = DIM (for divergence/gradient)
-    double V_H_;        // horizon volume
-    double beta_lap_;   // PD Laplacian coefficient = 4/(pi*delta^2) [2D]
+    double V_H_;        // horizon volume (uniform grid)
+    double beta_lap_;   // PD Laplacian coefficient (uniform grid)
+
+    // Per-node PD constants (only for AMR)
+    bool use_amr_ = false;
+    std::vector<double> V_H_node_;
+    std::vector<double> beta_lap_node_;
 
     void compute_pressure(Fields& f, const Config& cfg);
 };

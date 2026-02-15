@@ -17,7 +17,8 @@ struct Fields {
     // Phase: 0=solid, 1=liquid
     std::vector<uint8_t> phase;
     std::vector<int> grain_id;
-    std::vector<uint8_t> is_gb;  // grain boundary flag (1=GB, 0=interior)
+    std::vector<uint8_t> is_gb;      // grain boundary flag (1=GB, 0=interior)
+    std::vector<uint8_t> is_precip;  // precipitate site flag (1=precip, 0=normal)
 
     // Buffers for time integration
     std::vector<double> rho_new;
@@ -35,13 +36,22 @@ struct Fields {
         phase.resize(N, 1); // default liquid
         grain_id.resize(N, -1);
         is_gb.resize(N, 0);
+        is_precip.resize(N, 0);
 
         rho_new.resize(N, 0.0);
         vel_new.resize(N, vec_zero());
         C_new.resize(N, 0.0);
     }
 
+    // Swap only flow variables (rho, vel) — used by the flow solver.
+    // C is managed separately by the ARD solver.
     void swap_buffers() {
+        std::swap(rho, rho_new);
+        std::swap(vel, vel_new);
+    }
+
+    // Swap all buffers including concentration (used by explicit ARD solver)
+    void swap_all_buffers() {
         std::swap(rho, rho_new);
         std::swap(vel, vel_new);
         std::swap(C, C_new);

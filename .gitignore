@@ -7,6 +7,8 @@ cmake-build-*/
 output*/
 *.vti
 *.pvd
+metadata.csv
+
 
 # IDE
 .vscode/

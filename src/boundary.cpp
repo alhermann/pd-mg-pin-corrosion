@@ -113,19 +113,20 @@ void apply_outlet_bc(Fields& f, const Grid& g, const Config& cfg) {
         if (count > 0) {
             double inv_c = 1.0 / count;
             for (int d = 0; d < DIM; ++d) v_avg[d] *= inv_c;
-            C_avg *= inv_c;
 
             // Keep axial velocity from extrapolation, zero transverse
             Vec v_out = vec_zero();
             v_out[ax] = v_avg[ax];
             f.vel[i] = v_out;
-            f.C[i]   = C_avg;
         } else {
             Vec v_in = vec_zero();
             v_in[ax] = cfg.U_in;
             f.vel[i] = v_in;
-            f.C[i]   = cfg.C_liquid_init;
         }
+
+        // Convective outflow: zero-gradient extrapolation from interior
+        // (prevents artificial reflection of concentration at outlet)
+        f.C[i] = (count > 0) ? (C_avg / count) : 0.0;
     }
 }
 
@@ -249,16 +250,29 @@ void apply_wall_bc_new(Fields& f, const Grid& g, const Config& cfg) {
 }
 
 // ---------------------------------------------------------------------------
-// Wall concentration BC: C = 0 at tube walls (no dissolved Mg)
+// Wall concentration BC: Neumann (zero-gradient) at tube walls.
+//
+// Walls are impermeable — no mass flux through the wall, so dC/dn = 0.
+// Ghost nodes extrapolate concentration from nearest interior fluid neighbor.
 // ---------------------------------------------------------------------------
-void apply_wall_concentration_bc(Fields& f, const Grid& g) {
+void apply_wall_concentration_bc(Fields& f, const Grid& g, const Config& cfg) {
     int N = g.N_total;
 
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < N; ++i) {
-        if (g.node_type[i] == WALL) {
-            f.C[i] = 0.0;
+        if (g.node_type[i] != WALL) continue;
+
+        // Extrapolate from nearest fluid neighbor (zero-gradient)
+        double c_avg = 0.0;
+        int count = 0;
+        for (int jj = g.nbr_offset[i]; jj < g.nbr_offset[i + 1]; ++jj) {
+            int j = g.nbr_index[jj];
+            if (g.node_type[j] == FLUID) {
+                c_avg += f.C[j];
+                count++;
+            }
         }
+        f.C[i] = (count > 0) ? (c_avg / count) : 0.0;
     }
 }
 
@@ -273,17 +287,20 @@ void apply_wall_concentration_bc(Fields& f, const Grid& g) {
 // ---------------------------------------------------------------------------
 void smooth_boundary_concentration(Fields& f, const Grid& g, const Config& cfg) {
     int N = g.N_total;
-    double delta = cfg.delta;
     int ax = (DIM == 2) ? 1 : 2;  // axial direction index
 
     // Physical domain limits in axial direction (from grid geometry)
     double y_min_fluid = -cfg.L_upstream;
     double y_max_fluid = cfg.L_wire + cfg.L_downstream;
 
+    // Use per-node delta for AMR grids, global delta otherwise
+    double delta_global = cfg.use_amr ? cfg.delta_coarse : cfg.delta;
+
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < N; ++i) {
         if (g.node_type[i] != FLUID) continue;
 
+        double delta = (!g.delta_local.empty()) ? g.delta_local[i] : delta_global;
         double y = g.pos[i][ax];
         bool near_inlet = (y - y_min_fluid < delta);
         bool near_outlet = (y_max_fluid - y < delta);

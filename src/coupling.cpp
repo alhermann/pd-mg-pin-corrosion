@@ -10,28 +10,30 @@
 std::string CoupledSolver::make_filename(const Config& cfg, const std::string& prefix,
                                           double time_s, int frame) {
     std::ostringstream ss;
+    std::string ext = cfg.use_amr ? ".vtu" : ".vti";
     ss << cfg.output_dir << "/" << prefix
        << "_" << std::setw(6) << std::setfill('0') << frame
-       << "_t" << std::fixed << std::setprecision(1) << time_s << "s.vti";
+       << "_t" << std::fixed << std::setprecision(1) << time_s << "s" << ext;
     return ss.str();
 }
 
 void CoupledSolver::write_diagnostics(const Grid& grid, const Fields& fields,
                                        double t_corr, const Config& cfg) {
     int solid_count = 0;
-    double C_solid_sum = 0.0;
     int N = grid.N_total;
-
     for (int i = 0; i < N; ++i) {
-        if (grid.node_type[i] == SOLID_MG) {
-            solid_count++;
-            C_solid_sum += fields.C[i];
-        }
+        if (grid.node_type[i] == SOLID_MG) solid_count++;
     }
 
-    // Pin mass loss: fraction of initial solid mass that has been lost
-    // Initial mass ~ initial_solid_count * C_solid_init (= 1.0)
-    // Current mass ~ sum(C[solid_nodes])  +  dissolved_nodes*0
+    // Pin mass/volume loss: sum C for ALL initially-solid nodes (regardless
+    // of current type). This gives smooth behavior across dissolution events:
+    // when a node dissolves, its C is set to C_thresh and then decays via
+    // fluid-phase transport — no discrete jump in the loss metric.
+    double C_solid_sum = 0.0;
+    for (int idx : initial_solid_indices_) {
+        C_solid_sum += fields.C[idx];
+    }
+
     double pin_mass_loss = (1.0 - C_solid_sum / (initial_solid_count_ + 1e-30)) * 100.0;
     if (pin_mass_loss < 0.0) pin_mass_loss = 0.0;
 
@@ -83,13 +85,21 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
     // Create output directory
     mkdir(cfg.output_dir.c_str(), 0755);
 
+    // Set PVD paths so they are rewritten after each timestep (crash-safe)
+    writer_.set_pvd_path(cfg.output_dir + "/simulation.pvd");
+    flow_writer_.set_pvd_path(cfg.output_dir + "/flow.pvd");
+
     // Initialize CSV files (truncates old data)
     init_csv_files(cfg);
 
-    // Count initial solid nodes
+    // Record initial solid nodes (for smooth volume loss tracking)
     initial_solid_count_ = 0;
+    initial_solid_indices_.clear();
     for (int i = 0; i < grid.N_total; ++i) {
-        if (grid.node_type[i] == SOLID_MG) initial_solid_count_++;
+        if (grid.node_type[i] == SOLID_MG) {
+            initial_solid_count_++;
+            initial_solid_indices_.push_back(i);
+        }
     }
     std::printf("Initial solid nodes: %d\n", initial_solid_count_);
 
@@ -106,7 +116,8 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
 
     // Write initial state (this goes into PVD)
     std::string fname = make_filename(cfg, "state", 0.0, frame_count_);
-    writer_.write(fname, grid, fields, cfg);
+    if (cfg.use_amr) writer_.write_vtu(fname, grid, fields, cfg);
+    else             writer_.write(fname, grid, fields, cfg);
     writer_.add_timestep(0.0, fname);
     frame_count_++;
 
@@ -125,11 +136,15 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
             std::printf("  Flow re-solve triggered (%d nodes dissolved since last flow solve)\n",
                         dissolved_since_flow_);
             flow_solver_.solve_steady(fields, grid, cfg);
+            if (cfg.use_amr) grid.update_fictitious(fields);
             dissolved_since_flow_ = 0;
+            need_flow_solve = false;
 
-            // Write flow solution (for debugging only — NOT added to PVD)
+            // Write flow solution snapshot (added to flow PVD)
             fname = make_filename(cfg, "flow", t_corr, frame_count_);
-            writer_.write(fname, grid, fields, cfg);
+            if (cfg.use_amr) writer_.write_vtu(fname, grid, fields, cfg);
+            else             writer_.write(fname, grid, fields, cfg);
+            flow_writer_.add_timestep(t_corr, fname);
             frame_count_++;
         } else {
             std::printf("  Skipping flow solve (no dissolution since last flow solve)\n");
@@ -138,10 +153,19 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
         // Phase 2: Corrosion with frozen velocity field
         if (cfg.use_implicit) {
             // --- IMPLICIT PATH ---
+            // Compute current volume loss fraction for decay model
+            double C_solid_sum = 0.0;
+            for (int idx : initial_solid_indices_) {
+                C_solid_sum += fields.C[idx];
+            }
+            double vol_loss_frac = 1.0 - C_solid_sum / (initial_solid_count_ + 1e-30);
+            if (vol_loss_frac < 0.0) vol_loss_frac = 0.0;
+            ard_implicit_solver_.set_volume_loss(vol_loss_frac);
+
             // Assemble PD operator matrix once per coupling cycle
             ard_implicit_solver_.assemble(fields, grid, cfg);
 
-            int implicit_step = 0;
+            int implicit_step = 0;  // local counter for this cycle
             double t_cycle_start = t_corr;
             bool dissolution_occurred = false;
 
@@ -154,21 +178,26 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
                 // Apply concentration BCs
                 apply_inlet_bc(fields, grid, cfg);
                 apply_outlet_bc(fields, grid, cfg);
-                apply_wall_concentration_bc(fields, grid);
+                apply_wall_concentration_bc(fields, grid, cfg);
 
                 ard_implicit_solver_.step(fields, grid, cfg, dt_impl);
 
+                // Smooth truncated PD neighborhoods near inlet/outlet
                 smooth_boundary_concentration(fields, grid, cfg);
 
                 t_corr += dt_impl;
                 implicit_step++;
+                total_implicit_steps_++;
 
-                if (implicit_step % cfg.implicit_output_every == 0) {
+                if (total_implicit_steps_ % cfg.diagnostic_every == 0) {
+                    write_diagnostics(grid, fields, t_corr, cfg);
+                }
+                if (total_implicit_steps_ % cfg.implicit_output_every == 0) {
                     fname = make_filename(cfg, "corr", t_corr, frame_count_);
-                    writer_.write(fname, grid, fields, cfg);
+                    if (cfg.use_amr) writer_.write_vtu(fname, grid, fields, cfg);
+                    else             writer_.write(fname, grid, fields, cfg);
                     writer_.add_timestep(t_corr, fname);
                     frame_count_++;
-                    write_diagnostics(grid, fields, t_corr, cfg);
                 }
 
                 // Check if any solid node has actually reached dissolution threshold
@@ -184,24 +213,33 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
                         implicit_step, t_cycle_start, t_corr, t_corr / 3600.0);
         } else {
             // --- EXPLICIT PATH (fallback) ---
+            // Compute current volume loss fraction for decay model
+            {
+                double C_solid_sum = 0.0;
+                for (int idx : initial_solid_indices_) {
+                    C_solid_sum += fields.C[idx];
+                }
+                double vol_loss_frac = 1.0 - C_solid_sum / (initial_solid_count_ + 1e-30);
+                if (vol_loss_frac < 0.0) vol_loss_frac = 0.0;
+                ard_solver_.set_volume_loss(vol_loss_frac);
+            }
             double dt_corr = ard_solver_.compute_dt(fields, grid, cfg);
             std::printf("  Corrosion dt = %.4e s\n", dt_corr);
 
             for (int step = 1; step <= cfg.corrosion_steps_per_check; ++step) {
                 apply_inlet_bc(fields, grid, cfg);
                 apply_outlet_bc(fields, grid, cfg);
-                apply_wall_concentration_bc(fields, grid);
+                apply_wall_concentration_bc(fields, grid, cfg);
 
                 ard_solver_.step(fields, grid, cfg, dt_corr);
                 std::swap(fields.C, fields.C_new);
-
-                smooth_boundary_concentration(fields, grid, cfg);
 
                 t_corr += dt_corr;
 
                 if (step % cfg.output_every_corr == 0) {
                     fname = make_filename(cfg, "corr", t_corr, frame_count_);
-                    writer_.write(fname, grid, fields, cfg);
+                    if (cfg.use_amr) writer_.write_vtu(fname, grid, fields, cfg);
+                    else             writer_.write(fname, grid, fields, cfg);
                     writer_.add_timestep(t_corr, fname);
                     frame_count_++;
                     write_diagnostics(grid, fields, t_corr, cfg);
@@ -224,7 +262,10 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
 
             // Rebuild neighbor list so newly-FLUID nodes have correct bond structure
             std::printf("  Rebuilding neighbor list...\n");
-            grid.build_neighbors();
+            if (cfg.use_amr)
+                grid.build_neighbors_celllist(cfg);
+            else
+                grid.build_neighbors();
 
             // Re-solve flow next cycle: dissolved nodes are now interior fluid
             // and need velocity/pressure computed by PD-NS
@@ -247,12 +288,11 @@ void CoupledSolver::run(Grid& grid, Fields& fields, const Config& cfg) {
 
     // Write final state
     fname = make_filename(cfg, "final", t_corr, frame_count_);
-    writer_.write(fname, grid, fields, cfg);
+    if (cfg.use_amr) writer_.write_vtu(fname, grid, fields, cfg);
+    else             writer_.write(fname, grid, fields, cfg);
     writer_.add_timestep(t_corr, fname);
 
-    // Write PVD time series file
-    writer_.write_pvd(cfg.output_dir + "/simulation.pvd");
-
+    // PVD files are already up-to-date (written incrementally after each add_timestep)
     std::printf("\n=== Simulation complete ===\n");
     std::printf("  Final time: %.1f s (%.2f h)\n", t_corr, t_corr / 3600.0);
     t_total.report();

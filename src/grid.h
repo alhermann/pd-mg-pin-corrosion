@@ -4,13 +4,16 @@
 #include <vector>
 #include <cstdint>
 
+struct Fields; // forward declaration
+
 enum NodeType : uint8_t {
-    FLUID    = 0,
-    SOLID_MG = 1,
-    WALL     = 2,
-    INLET    = 3,
-    OUTLET   = 4,
-    OUTSIDE  = 5
+    FLUID      = 0,
+    SOLID_MG   = 1,
+    WALL       = 2,
+    INLET      = 3,
+    OUTLET     = 4,
+    OUTSIDE    = 5,
+    FICTITIOUS = 6  // AMR fictitious coupling node
 };
 
 struct Grid {
@@ -36,8 +39,21 @@ struct Grid {
     std::vector<Vec> nbr_evec;
     std::vector<double> nbr_vol;
 
+    // AMR per-node data (empty when use_amr=0)
+    std::vector<double> dx_local;     // per-node grid spacing
+    std::vector<double> delta_local;  // per-node horizon
+    std::vector<int> grid_level;      // 0=fine, 1=coarse
+
+    // Fictitious node IDW interpolation data (CSR format)
+    std::vector<int> fict_offset;     // [N_total+1]
+    std::vector<int> fict_source;     // source node global indices
+    std::vector<double> fict_weight;  // normalized IDW weights
+
     void build(const Config& cfg);
     void build_neighbors();
+    void build_amr(const Config& cfg);
+    void build_neighbors_celllist(const Config& cfg);
+    void update_fictitious(Fields& fields) const;
 
     inline int idx(int i, int j, int k = 0) const {
         if constexpr (DIM == 2) {
