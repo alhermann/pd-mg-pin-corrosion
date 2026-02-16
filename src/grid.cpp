@@ -546,7 +546,7 @@ void Grid::build_amr(const Config& cfg) {
                     double dz = pos[s][1] - py;
                     double d2 = dr * dr + dz * dz;
                     if (d2 < 1e-30) d2 = 1e-30;
-                    double w = 1.0 / d2;
+                    double w = 1.0 / (d2 * d2);  // p=4 IDW: sharper than 1/d²
                     fi.sources.push_back(s);
                     fi.weights.push_back(w);
                     W += w;
@@ -593,7 +593,7 @@ void Grid::build_amr(const Config& cfg) {
                     double dz = pos[s][1] - py;
                     double d2 = dr * dr + dz * dz;
                     if (d2 < 1e-30) d2 = 1e-30;
-                    double w = 1.0 / d2;
+                    double w = 1.0 / (d2 * d2);  // p=4 IDW: sharper than 1/d²
                     fi.sources.push_back(s);
                     fi.weights.push_back(w);
                     W += w;

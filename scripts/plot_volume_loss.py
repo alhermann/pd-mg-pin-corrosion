@@ -105,7 +105,7 @@ def main():
     ax2.set_xlabel("Time (h)", fontsize=12)
     ax2.set_ylabel("Instantaneous rate (%/h)", fontsize=12)
     ax2.set_xlim(0, max(t_sim.max(), t_exp.max()) * 1.05)
-    ax2.set_ylim(0, None)
+    ax2.set_ylim(0, 10)
     ax2.legend(fontsize=11, loc="upper left")
     ax2.grid(True, alpha=0.3)
     ax2.set_title("Dissolution rate", fontsize=13)

@@ -73,11 +73,9 @@ void VTKWriter::write(const std::string& filename,
     out << "        </DataArray>\n";
 
     // Pressure
-    // WALL and OUTSIDE: zero for clean visualization
     out << "        <DataArray type=\"Float64\" Name=\"pressure\" format=\"ascii\">\n";
     for (int i = 0; i < N; ++i) {
-        bool fictitious = (grid.node_type[i] == WALL || grid.node_type[i] == OUTSIDE);
-        out << "          " << (fictitious ? 0.0 : safe_val(fields.pressure[i])) << "\n";
+        out << "          " << safe_val(fields.pressure[i]) << "\n";
     }
     out << "        </DataArray>\n";
 
@@ -266,8 +264,7 @@ void VTKWriter::write_vtu(const std::string& filename,
     // Pressure
     out << "        <DataArray type=\"Float64\" Name=\"pressure\" format=\"ascii\">\n";
     for (int idx : output_nodes) {
-        bool fict = (grid.node_type[idx] == WALL);
-        out << "          " << (fict ? 0.0 : safe_val(fields.pressure[idx])) << "\n";
+        out << "          " << safe_val(fields.pressure[idx]) << "\n";
     }
     out << "        </DataArray>\n";
 
