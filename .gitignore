@@ -23,5 +23,12 @@ metadata.csv
 # Reference papers
 references/
 
+# Project logs (local only)
+PROJECT_LOG.md
+CHANGELOG.md
+
+# Legacy scripts
+scripts/legacy/
+
 # Claude Code
 .claude/
