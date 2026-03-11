@@ -79,6 +79,9 @@ struct Config {
     double newton_tol = 1.0e-8;         // relative residual convergence tolerance
     int newton_max_iter = 20;           // max Newton iterations per implicit step
 
+    // Channel flow corrections (Poiseuille validation only)
+    int channel_flow_corrections = 0;  // 1=enforce v_transverse=0 and average rho cross-sectionally
+
     // AMR (Adaptive Mesh Refinement)
     int use_amr = 0;              // 0=uniform, 1=two-level AMR
     int amr_ratio = 3;            // dx_coarse = amr_ratio * dx (fine)

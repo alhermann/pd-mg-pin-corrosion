@@ -204,6 +204,71 @@ int PD_NS_Solver::solve_steady(Fields& fields, const Grid& grid, const Config& c
         // Apply BCs to new fields (wall mirroring of vel_new, rho_new)
         apply_wall_bc_new(fields, grid, cfg);
 
+        // Channel flow corrections: enforce v_transverse=0 and uniform
+        // cross-sectional density.  Only for Poiseuille validation (no wire).
+        if (cfg.channel_flow_corrections) {
+            int ax = (DIM == 2) ? 1 : 2;
+
+            // Enforce v_transverse = 0
+            #pragma omp parallel for schedule(static)
+            for (int i = 0; i < N; ++i) {
+                if (grid.node_type[i] != FLUID) continue;
+                for (int d = 0; d < DIM; ++d) {
+                    if (d == ax) continue;
+                    fields.vel_new[i][d] = 0.0;
+                }
+            }
+
+            // Cross-sectional density averaging
+            if constexpr (DIM == 2) {
+                int Nx = grid.Nx, Ny = grid.Ny;
+                #pragma omp parallel for schedule(static)
+                for (int j = 0; j < Ny; ++j) {
+                    double rho_sum = 0.0;
+                    int count = 0;
+                    for (int ii = 0; ii < Nx; ++ii) {
+                        int n = j * Nx + ii;
+                        if (grid.node_type[n] == FLUID) {
+                            rho_sum += fields.rho_new[n];
+                            count++;
+                        }
+                    }
+                    if (count > 0) {
+                        double rho_avg = rho_sum / count;
+                        for (int ii = 0; ii < Nx; ++ii) {
+                            int n = j * Nx + ii;
+                            if (grid.node_type[n] == FLUID)
+                                fields.rho_new[n] = rho_avg;
+                        }
+                    }
+                }
+            } else {
+                int Nx = grid.Nx, Ny = grid.Ny, Nz = grid.Nz;
+                #pragma omp parallel for schedule(static)
+                for (int k = 0; k < Nz; ++k) {
+                    double rho_sum = 0.0;
+                    int count = 0;
+                    for (int j = 0; j < Ny; ++j)
+                        for (int ii = 0; ii < Nx; ++ii) {
+                            int n = k * (Nx * Ny) + j * Nx + ii;
+                            if (grid.node_type[n] == FLUID) {
+                                rho_sum += fields.rho_new[n];
+                                count++;
+                            }
+                        }
+                    if (count > 0) {
+                        double rho_avg = rho_sum / count;
+                        for (int j = 0; j < Ny; ++j)
+                            for (int ii = 0; ii < Nx; ++ii) {
+                                int n = k * (Nx * Ny) + j * Nx + ii;
+                                if (grid.node_type[n] == FLUID)
+                                    fields.rho_new[n] = rho_avg;
+                            }
+                    }
+                }
+            }
+        }
+
         // Convergence check
         if (iter <= 10 || iter % 100 == 0) {
             double num = 0.0, den = 0.0;

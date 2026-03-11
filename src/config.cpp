@@ -83,6 +83,7 @@ void Config::load(const std::string& filename) {
         else if (key == "diagnostic_every")    diagnostic_every = std::stoi(val);
         else if (key == "newton_tol")            newton_tol = std::stod(val);
         else if (key == "newton_max_iter")       newton_max_iter = std::stoi(val);
+        else if (key == "channel_flow_corrections") channel_flow_corrections = std::stoi(val);
         else if (key == "use_amr")              use_amr = std::stoi(val);
         else if (key == "amr_ratio")            amr_ratio = std::stoi(val);
         else if (key == "amr_buffer")           amr_buffer = std::stod(val);
